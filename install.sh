@@ -319,9 +319,13 @@ bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-rele
 log_info "Xray 安装完成"
 
 # ---- 生成密钥对 ----
+# xray x25519 输出格式:
+#   PrivateKey: xxxx
+#   Password: xxxx    ← 这就是 Public Key，xray 把它叫 Password
+#   Hash32: xxxx
 KEYPAIR=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYPAIR" | grep "Private" | awk '{print $NF}')
-PUBLIC_KEY=$(echo "$KEYPAIR"  | grep "Public"  | awk '{print $NF}')
+PRIVATE_KEY=$(echo "$KEYPAIR" | grep PrivateKey | awk '{print $2}')
+PUBLIC_KEY=$(echo "$KEYPAIR" | grep Password | awk '{print $2}')
 
 # ---- 生成 Short ID ----
 SHORT_ID=$(openssl rand -hex 8)
@@ -395,13 +399,39 @@ if [ "$ENABLE_WARP" = true ]; then
     if [ "$ENABLE_WARP" = true ] && command -v warp-cli &> /dev/null; then
         log_info "配置 WARP 客户端..."
 
-        # 注册 WARP（如果尚未注册）
-        # warp-cli 在未注册时 status 会报错，所以用注册命令来判断
-        if ! warp-cli --accept-tos status 2>/dev/null | grep -q "Registration"; then
+        # 等待 warp-svc 守护进程完全就绪
+        # 刚安装完 cloudflare-warp 后，warp-svc 需要几秒钟来初始化
+        # 如果在这之前就调用 warp-cli，会出现 "Registration Missing
+        # due to: Daemon Startup" 之类的错误
+        log_info "等待 WARP 守护进程就绪..."
+        for i in $(seq 1 15); do
+            if warp-cli --accept-tos status 2>/dev/null | grep -qi "Disconnected\|Connected"; then
+                log_info "WARP 守护进程已就绪"
+                break
+            fi
+            if [ "$i" -eq 15 ]; then
+                log_warn "等待超时，继续尝试..."
+            fi
+            sleep 2
+        done
+
+        # 注册 WARP
+        # 判断是否已经注册：检查 status 里是否包含 "Registration Missing"
+        # 注意: 不能用 grep "Registration" 来判断，因为
+        # "Registration Missing" 也包含这个词，会导致误判为已注册
+        WARP_STATUS_CHECK=$(warp-cli --accept-tos status 2>&1 || true)
+        if echo "$WARP_STATUS_CHECK" | grep -qi "Registration Missing\|Missing\|Unable"; then
             log_info "注册 WARP..."
-            warp-cli --accept-tos registration new 2>/dev/null || true
-        else
+            warp-cli --accept-tos registration new
+            sleep 3
+            log_info "WARP 注册完成"
+        elif echo "$WARP_STATUS_CHECK" | grep -qi "Disconnected\|Connected"; then
             log_info "WARP 已注册，跳过注册步骤"
+        else
+            # 无法判断状态，尝试注册一次（重复注册不会出错）
+            log_info "WARP 状态不确定，尝试注册..."
+            warp-cli --accept-tos registration new 2>/dev/null || true
+            sleep 3
         fi
 
         # 设置为 proxy 模式（仅开 SOCKS5 端口，不接管系统全部流量）
@@ -419,14 +449,22 @@ if [ "$ENABLE_WARP" = true ]; then
         log_info "连接 WARP..."
         warp-cli --accept-tos connect
 
-        # 等待连接建立
-        sleep 3
+        # 等待连接建立（使用重试循环，最多等 30 秒）
+        # WARP 连接需要与 Cloudflare 边缘服务器建立 WireGuard 隧道，
+        # 根据网络条件可能需要 5-15 秒不等
+        WARP_CONNECTED=false
+        log_info "等待 WARP 连接建立..."
+        for i in $(seq 1 15); do
+            WARP_STATUS=$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")
+            if echo "$WARP_STATUS" | grep -qi "Connected" && ! echo "$WARP_STATUS" | grep -qi "Disconnected"; then
+                WARP_CONNECTED=true
+                log_info "WARP 连接成功 (等待了约 $((i*2)) 秒)"
+                break
+            fi
+            sleep 2
+        done
 
-        # 验证 WARP 连接状态
-        WARP_STATUS=$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")
-        if echo "$WARP_STATUS" | grep -qi "Connected"; then
-            log_info "WARP 连接成功"
-
+        if [ "$WARP_CONNECTED" = true ]; then
             # 验证 SOCKS5 端口是否在监听
             if ss -tlnp | grep -q ":${WARP_SOCKS_PORT}"; then
                 log_info "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 监听正常"
@@ -441,11 +479,22 @@ if [ "$ENABLE_WARP" = true ]; then
             if [ "$WARP_IP" != "$SERVER_IP" ] && [ "$WARP_IP" != "获取失败" ]; then
                 log_info "WARP 出口 IP 与 VPS IP 不同，WARP 工作正常"
             else
-                log_warn "WARP 出口 IP 可能异常，请稍后手动验证"
+                log_warn "WARP 出口 IP 获取异常，请稍后手动验证:"
+                log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
             fi
         else
-            log_warn "WARP 连接状态异常: ${WARP_STATUS}"
-            log_warn "请稍后手动检查: warp-cli status"
+            log_warn "WARP 连接超时 (等待了 30 秒)"
+            log_warn "最后状态: ${WARP_STATUS}"
+            log_warn ""
+            log_warn "这通常是因为 WARP 守护进程刚启动需要更多时间"
+            log_warn "请稍后手动执行以下命令来完成连接:"
+            log_warn "  warp-cli disconnect"
+            log_warn "  warp-cli registration new"
+            log_warn "  warp-cli mode proxy"
+            log_warn "  warp-cli proxy port ${WARP_SOCKS_PORT}"
+            log_warn "  warp-cli connect"
+            log_warn "  warp-cli status"
+            log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
         fi
 
         # 设置 WARP 开机自启
