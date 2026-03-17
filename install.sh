@@ -1,17 +1,30 @@
 #!/bin/bash
 
 # =============================================================
-# Xray 一键部署脚本 (增强版 v3)
+# Xray 一键部署脚本 (增强版 v4 — 含 WARP)
 # 协议: VLESS + Reality + XTLS Vision
-# sing-box 配置语法: 1.11+ (新版)
+# sing-box 配置语法: 1.11+
 #
-# 新增功能:
-#   1. 选择客户端系统类型 (iOS/macOS/Android/Windows/Linux)
-#      → 不同系统 inbounds 结构不同
-#   2. 选择 TLS 指纹（根据系统自动推荐）
-#   3. 选择路由模式（全局 / 国内外分流）
-#   4. 终端完整显示 sing-box JSON 配置 + 保存文件
-#   5. 生成 VLESS 分享链接
+# 功能:
+#   1. 部署 Xray VLESS+Reality 服务端
+#   2. 安装 Cloudflare WARP 并配置 SOCKS5 代理出口
+#   3. Xray 路由规则: ChatGPT / Claude 流量走 WARP 出口
+#   4. 选择客户端系统类型 (iOS/macOS/Android/Windows/Linux)
+#   5. 选择 TLS 指纹（根据系统自动推荐）
+#   6. 选择路由模式（全局 / 国内外分流）
+#   7. 终端完整显示 sing-box 客户端 JSON + 保存文件
+#   8. 生成 VLESS 分享链接
+#
+# WARP 工作原理:
+#   VPS 上安装 Cloudflare WARP 客户端后，它会在本地开一个
+#   SOCKS5 代理端口 (127.0.0.1:40000)。Xray 服务端配置中
+#   新增一个 "warp" outbound，通过这个 SOCKS5 端口将流量
+#   转发给 Cloudflare 网络。路由规则指定 ChatGPT 和 Claude
+#   相关域名走 warp outbound，其他流量仍然直连 (freedom)。
+#
+#   流量路径:
+#     客户端 → Xray(VPS) → WARP SOCKS5 → Cloudflare网络 → 目标网站
+#                         ↘ 其他流量直接出去 (freedom)
 # =============================================================
 
 set -e
@@ -49,8 +62,8 @@ fi
 clear
 echo ""
 print_dline
-echo -e "${BOLD}${MAGENTA}     Xray VLESS + Reality 一键部署 (v3)${NC}"
-echo -e "${DIM}     sing-box 1.11+ 新版配置语法${NC}"
+echo -e "${BOLD}${MAGENTA}     Xray VLESS + Reality 一键部署 (v4)${NC}"
+echo -e "${DIM}     含 Cloudflare WARP · sing-box 1.11+ 语法${NC}"
 print_dline
 echo ""
 log_warn "以下信息将写入服务端配置，请准确填写"
@@ -90,28 +103,65 @@ read -p "$(echo -e ${CYAN}'请输入 SNI 域名（直接回车使用默认 cdn.j
 INPUT_SNI=${INPUT_SNI:-cdn.jsdelivr.net}
 
 # =============================================================
+# 交互 — 是否启用 WARP
+# =============================================================
+echo ""
+print_line
+echo -e "${BOLD}  Cloudflare WARP 配置${NC}"
+echo -e "${DIM}  WARP 可以让指定流量通过 Cloudflare 干净 IP 出去${NC}"
+echo -e "${DIM}  避免 VPS IP 被 ChatGPT / Claude 等服务封锁${NC}"
+print_line
+echo ""
+echo -e "  ${GREEN}1)${NC} 启用 WARP   ${YELLOW}← 推荐：ChatGPT + Claude 走 WARP${NC}"
+echo -e "  ${GREEN}2)${NC} 不启用      ${DIM}所有流量直接从 VPS IP 出去${NC}"
+echo ""
+
+while true; do
+    read -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认启用）: '${NC})" WARP_CHOICE
+    WARP_CHOICE=${WARP_CHOICE:-1}
+    case "$WARP_CHOICE" in
+        1) ENABLE_WARP=true;  break ;;
+        2) ENABLE_WARP=false; break ;;
+        *) log_error "无效选项，请输入 1-2" ;;
+    esac
+done
+
+# 如果启用 WARP，询问 SOCKS5 端口
+WARP_SOCKS_PORT=40000
+if [ "$ENABLE_WARP" = true ]; then
+    log_info "已选择启用 WARP"
+    read -p "$(echo -e ${CYAN}'WARP SOCKS5 本地端口（直接回车使用默认 40000）: '${NC})" WARP_PORT_INPUT
+    WARP_SOCKS_PORT=${WARP_PORT_INPUT:-40000}
+
+    # 询问需要走 WARP 的服务
+    echo ""
+    echo -e "  ${BOLD}选择需要走 WARP 出口的服务:${NC}"
+    echo ""
+    echo -e "  ${GREEN}1)${NC} ChatGPT + Claude          ${YELLOW}← 推荐${NC}"
+    echo -e "  ${GREEN}2)${NC} ChatGPT + Claude + Google"
+    echo -e "  ${GREEN}3)${NC} ChatGPT + Claude + Google + Netflix"
+    echo -e "  ${GREEN}4)${NC} 全部流量走 WARP           ${DIM}(所有出站都经过 Cloudflare)${NC}"
+    echo ""
+
+    while true; do
+        read -p "$(echo -e ${CYAN}'请输入选项 [1-4]（直接回车默认 1）: '${NC})" WARP_ROUTE_CHOICE
+        WARP_ROUTE_CHOICE=${WARP_ROUTE_CHOICE:-1}
+        case "$WARP_ROUTE_CHOICE" in
+            1) WARP_ROUTE_MODE="ai";       break ;;
+            2) WARP_ROUTE_MODE="ai+google"; break ;;
+            3) WARP_ROUTE_MODE="ai+google+netflix"; break ;;
+            4) WARP_ROUTE_MODE="all";      break ;;
+            *) log_error "无效选项，请输入 1-4" ;;
+        esac
+    done
+    log_info "WARP 路由模式: ${WARP_ROUTE_MODE}"
+else
+    log_info "已选择不启用 WARP"
+fi
+
+# =============================================================
 # 交互 — 客户端系统类型
 # =============================================================
-#
-#  不同操作系统上 sing-box 的 inbounds 配置存在本质区别:
-#
-#  ┌──────────┬───────────────────────────────────────────────────────────┐
-#  │ iOS      │ 纯 tun。系统 Network Extension 接管全部流量。            │
-#  │          │ 不需要 mixed 入站，App 不在本地开代理端口。              │
-#  ├──────────┼───────────────────────────────────────────────────────────┤
-#  │ macOS    │ tun 为主。可选加 mixed 入站给终端/浏览器手动设代理用。   │
-#  │          │ interface_name 通常为 utun0。                            │
-#  ├──────────┼───────────────────────────────────────────────────────────┤
-#  │ Android  │ 纯 tun。通过 VPN Service API 创建虚拟网卡，             │
-#  │          │ 系统级接管所有 App 流量。                                │
-#  ├──────────┼───────────────────────────────────────────────────────────┤
-#  │ Windows  │ tun + mixed。TUN 全局接管 + mixed(HTTP/SOCKS5)入站       │
-#  │          │ 给浏览器扩展(SwitchyOmega)等使用。需管理员权限。        │
-#  ├──────────┼───────────────────────────────────────────────────────────┤
-#  │ Linux    │ tun + mixed + tproxy。mixed 供终端 export proxy 用；     │
-#  │          │ tproxy 端口供旁路由/网关做透明代理。                     │
-#  └──────────┴───────────────────────────────────────────────────────────┘
-#
 echo ""
 print_line
 echo -e "${BOLD}  请选择客户端系统类型${NC}"
@@ -140,7 +190,7 @@ done
 log_info "已选择客户端系统: ${CLIENT_OS}"
 
 # =============================================================
-# 交互 — TLS 指纹（根据系统推荐默认值）
+# 交互 — TLS 指纹
 # =============================================================
 case "$CLIENT_OS" in
     ios)     DEFAULT_FP="safari";  DEFAULT_FP_NUM=3 ;;
@@ -153,7 +203,7 @@ esac
 echo ""
 print_line
 echo -e "${BOLD}  请选择 TLS 客户端指纹 (uTLS Fingerprint)${NC}"
-echo -e "${DIM}  (建议与客户端系统匹配，已根据系统推荐默认值)${NC}"
+echo -e "${DIM}  (已根据客户端系统推荐默认值)${NC}"
 print_line
 echo ""
 echo -e "  ${GREEN}1)${NC} chrome       $([ "$DEFAULT_FP" = "chrome"  ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
@@ -182,7 +232,7 @@ log_info "已选择 TLS 指纹: ${CLIENT_FINGERPRINT}"
 # =============================================================
 echo ""
 print_line
-echo -e "${BOLD}  请选择 sing-box 路由模式${NC}"
+echo -e "${BOLD}  请选择 sing-box 客户端路由模式${NC}"
 print_line
 echo ""
 echo -e "  ${GREEN}1)${NC} 全局代理     ${YELLOW}← 所有流量走代理${NC}"
@@ -201,13 +251,34 @@ done
 log_info "已选择路由模式: ${ROUTE_MODE}"
 
 echo ""
-log_info "即将安装 Xray 并生成 Reality 密钥对..."
+echo ""
+print_line
+echo -e "${BOLD}  配置汇总确认${NC}"
+print_line
+echo ""
+echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
+echo -e "  端口        : ${GREEN}${INPUT_PORT}${NC}"
+echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
+echo -e "  WARP        : ${GREEN}$([ "$ENABLE_WARP" = true ] && echo "启用 (${WARP_ROUTE_MODE})" || echo "未启用")${NC}"
+echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
+echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
+echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
+echo ""
+read -p "$(echo -e ${CYAN}'确认以上配置开始部署？[Y/n]: '${NC})" CONFIRM
+CONFIRM=${CONFIRM:-Y}
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    log_warn "已取消部署"
+    exit 0
+fi
+
+echo ""
+log_info "开始部署..."
 echo ""
 
 # =============================================================
 # 安装 Xray
 # =============================================================
-log_step "开始安装 Xray..."
+log_step "安装 Xray..."
 bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 log_info "Xray 安装完成"
 
@@ -234,22 +305,234 @@ echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
 echo -e "  Private Key : ${GREEN}${PRIVATE_KEY}${NC}"
 echo -e "  Public Key  : ${GREEN}${PUBLIC_KEY}${NC}"
 echo -e "  Short ID    : ${GREEN}${SHORT_ID}${NC}"
-echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
-echo -e "  端口        : ${GREEN}${INPUT_PORT}${NC}"
-echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
-echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
-echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
 echo -e "  服务器 IP   : ${GREEN}${SERVER_IP}${NC}"
 echo ""
 print_dline
 echo ""
 
 # =============================================================
+# 安装并配置 Cloudflare WARP (如果启用)
+# =============================================================
+if [ "$ENABLE_WARP" = true ]; then
+    log_step "安装 Cloudflare WARP..."
+
+    # 检测系统类型
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        OS_VERSION="$VERSION_CODENAME"
+    fi
+
+    # 安装 WARP 客户端
+    # 如果已安装则跳过下载步骤
+    if ! command -v warp-cli &> /dev/null; then
+        log_info "正在添加 Cloudflare WARP 仓库..."
+
+        case "$OS_ID" in
+            ubuntu|debian)
+                # 添加 Cloudflare GPG key 和仓库
+                curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+                    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+                echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${OS_VERSION} main" \
+                    > /etc/apt/sources.list.d/cloudflare-client.list
+
+                apt-get update
+                apt-get install -y cloudflare-warp
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                rpm -ivh "https://pkg.cloudflareclient.com/cloudflare-release-el$(rpm -E %rhel).rpm" 2>/dev/null \
+                    || rpm -ivh "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
+                yum install -y cloudflare-warp || dnf install -y cloudflare-warp
+                ;;
+            *)
+                log_error "不支持的系统: ${OS_ID}，请手动安装 cloudflare-warp"
+                log_warn "跳过 WARP 安装，其他配置将继续..."
+                ENABLE_WARP=false
+                ;;
+        esac
+    else
+        log_info "warp-cli 已安装，跳过安装步骤"
+    fi
+
+    # 配置 WARP（仅在安装成功时执行）
+    if [ "$ENABLE_WARP" = true ] && command -v warp-cli &> /dev/null; then
+        log_info "配置 WARP 客户端..."
+
+        # 注册 WARP（如果尚未注册）
+        # warp-cli 在未注册时 status 会报错，所以用注册命令来判断
+        if ! warp-cli --accept-tos status 2>/dev/null | grep -q "Registration"; then
+            log_info "注册 WARP..."
+            warp-cli --accept-tos registration new 2>/dev/null || true
+        else
+            log_info "WARP 已注册，跳过注册步骤"
+        fi
+
+        # 设置为 proxy 模式（仅开 SOCKS5 端口，不接管系统全部流量）
+        #
+        # 这一步很关键：WARP 有两种运行模式
+        #   - warp 模式：接管整个系统的网络流量（会影响 SSH 连接！）
+        #   - proxy 模式：仅在本地开一个 SOCKS5 代理端口，不影响系统网络
+        #
+        # 我们选择 proxy 模式，让 Xray 通过 SOCKS5 端口选择性地转发流量
+        log_info "设置 WARP 为 proxy 模式 (SOCKS5 端口: ${WARP_SOCKS_PORT})..."
+        warp-cli --accept-tos mode proxy
+        warp-cli --accept-tos proxy port ${WARP_SOCKS_PORT}
+
+        # 连接 WARP
+        log_info "连接 WARP..."
+        warp-cli --accept-tos connect
+
+        # 等待连接建立
+        sleep 3
+
+        # 验证 WARP 连接状态
+        WARP_STATUS=$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")
+        if echo "$WARP_STATUS" | grep -qi "Connected"; then
+            log_info "WARP 连接成功"
+
+            # 验证 SOCKS5 端口是否在监听
+            if ss -tlnp | grep -q ":${WARP_SOCKS_PORT}"; then
+                log_info "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 监听正常"
+            else
+                log_warn "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 未检测到监听"
+                log_warn "请稍后手动检查: ss -tlnp | grep ${WARP_SOCKS_PORT}"
+            fi
+
+            # 测试 WARP 出口 IP（通过 WARP SOCKS5 代理访问）
+            WARP_IP=$(curl -s --max-time 10 --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me 2>/dev/null || echo "获取失败")
+            log_info "WARP 出口 IP: ${WARP_IP}"
+            if [ "$WARP_IP" != "$SERVER_IP" ] && [ "$WARP_IP" != "获取失败" ]; then
+                log_info "WARP 出口 IP 与 VPS IP 不同，WARP 工作正常"
+            else
+                log_warn "WARP 出口 IP 可能异常，请稍后手动验证"
+            fi
+        else
+            log_warn "WARP 连接状态异常: ${WARP_STATUS}"
+            log_warn "请稍后手动检查: warp-cli status"
+        fi
+
+        # 设置 WARP 开机自启
+        systemctl enable warp-svc 2>/dev/null || true
+
+    fi
+fi
+
+# =============================================================
+# 构建 WARP 相关的域名列表（用于 Xray 服务端路由规则）
+# =============================================================
+#
+# 这些域名列表决定了哪些流量会被转发到 WARP SOCKS5 出口。
+# 每个服务的域名来自实际抓包和官方文档，覆盖了 API、CDN、
+# 认证、WebSocket 等所有必要的子域名。
+#
+
+# ChatGPT / OpenAI 相关域名
+OPENAI_DOMAINS=(
+    "openai.com"
+    "chat.openai.com"
+    "auth0.openai.com"
+    "platform.openai.com"
+    "api.openai.com"
+    "chatgpt.com"
+    "auth.openai.com"
+    "operator.chatgpt.com"
+    "ab.chatgpt.com"
+    "cdn.oaistatic.com"
+    "oaistatic.com"
+    "oaiusercontent.com"
+    "files.oaiusercontent.com"
+    "sentry.io"
+    "intercomcdn.com"
+    "intercom.io"
+    "featuregates.org"
+    "statsigapi.net"
+    "identrust.com"
+)
+
+# Claude / Anthropic 相关域名
+CLAUDE_DOMAINS=(
+    "anthropic.com"
+    "claude.ai"
+    "api.anthropic.com"
+    "console.anthropic.com"
+    "docs.anthropic.com"
+    "support.anthropic.com"
+    "cdn.anthropic.com"
+    "statsig.anthropic.com"
+    "servd-anthropic.b-cdn.net"
+)
+
+# Google 相关域名（可选）
+GOOGLE_DOMAINS=(
+    "google.com"
+    "googleapis.com"
+    "google.com.hk"
+    "googleusercontent.com"
+    "gstatic.com"
+    "ggpht.com"
+    "googlevideo.com"
+    "youtube.com"
+    "ytimg.com"
+    "gmail.com"
+    "google.co.jp"
+)
+
+# Netflix 相关域名（可选）
+NETFLIX_DOMAINS=(
+    "netflix.com"
+    "netflix.net"
+    "nflxvideo.net"
+    "nflximg.net"
+    "nflximg.com"
+    "nflxext.com"
+    "nflxso.net"
+)
+
+# =============================================================
+# 根据用户选择组装 WARP 域名路由规则
+# =============================================================
+build_warp_domain_rules() {
+    # 此函数生成 Xray 路由规则中的 domain 数组内容
+    local ALL_WARP_DOMAINS=()
+
+    if [ "$ENABLE_WARP" = true ]; then
+        # ChatGPT + Claude 始终包含
+        ALL_WARP_DOMAINS+=("${OPENAI_DOMAINS[@]}")
+        ALL_WARP_DOMAINS+=("${CLAUDE_DOMAINS[@]}")
+
+        # 根据选择追加 Google
+        if [[ "$WARP_ROUTE_MODE" == "ai+google" || "$WARP_ROUTE_MODE" == "ai+google+netflix" ]]; then
+            ALL_WARP_DOMAINS+=("${GOOGLE_DOMAINS[@]}")
+        fi
+
+        # 根据选择追加 Netflix
+        if [[ "$WARP_ROUTE_MODE" == "ai+google+netflix" ]]; then
+            ALL_WARP_DOMAINS+=("${NETFLIX_DOMAINS[@]}")
+        fi
+    fi
+
+    # 输出为 JSON 数组格式
+    local FIRST=true
+    for domain in "${ALL_WARP_DOMAINS[@]}"; do
+        if [ "$FIRST" = true ]; then
+            echo -n "\"domain:${domain}\""
+            FIRST=false
+        else
+            echo -n ", \"domain:${domain}\""
+        fi
+    done
+}
+
+# =============================================================
 # 写入 Xray 服务端配置
 # =============================================================
 log_step "写入 Xray 服务端配置文件..."
 
-cat > /usr/local/etc/xray/config.json << EOF
+# 根据是否启用 WARP 以及路由模式，生成不同的服务端配置
+if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
+    # ---- 全部流量走 WARP：default outbound 改为 warp ----
+    cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": {
     "loglevel": "warning"
@@ -275,13 +558,165 @@ cat > /usr/local/etc/xray/config.json << EOF
           "show": false,
           "dest": "${INPUT_SNI}:443",
           "xver": 0,
-          "serverNames": [
-            "${INPUT_SNI}"
-          ],
+          "serverNames": ["${INPUT_SNI}"],
           "privateKey": "${PRIVATE_KEY}",
-          "shortIds": [
-            "${SHORT_ID}"
-          ]
+          "shortIds": ["${SHORT_ID}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "socks",
+      "tag": "warp",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": ${WARP_SOCKS_PORT}
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}
+EOF
+
+elif [ "$ENABLE_WARP" = true ]; then
+    # ---- 指定域名走 WARP，其他流量直连 ----
+    # 先构建域名列表
+    WARP_DOMAIN_JSON=$(build_warp_domain_rules)
+
+    cat > /usr/local/etc/xray/config.json << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${INPUT_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${INPUT_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${INPUT_SNI}:443",
+          "xver": 0,
+          "serverNames": ["${INPUT_SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "socks",
+      "tag": "warp",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": ${WARP_SOCKS_PORT}
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "domain": [${WARP_DOMAIN_JSON}],
+        "outboundTag": "warp"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}
+EOF
+
+else
+    # ---- 不启用 WARP，纯 freedom 出站 ----
+    cat > /usr/local/etc/xray/config.json << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${INPUT_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${INPUT_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${INPUT_SNI}:443",
+          "xver": 0,
+          "serverNames": ["${INPUT_SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
         }
       },
       "sniffing": {
@@ -312,6 +747,7 @@ cat > /usr/local/etc/xray/config.json << EOF
   }
 }
 EOF
+fi
 
 log_info "服务端配置已写入 /usr/local/etc/xray/config.json"
 
@@ -364,18 +800,7 @@ else
 fi
 
 # =============================================================
-# =============================================================
-#
-#   生成 sing-box 1.11+ 完整客户端配置
-#
-#   语法要点 (与旧版 1.8 的区别):
-#     - DNS 服务器用 "type"+"server" 结构体，不再用 "address" URL
-#     - TUN inbound 用 "address":[] 数组，不再用 inet4_address/inet6_address
-#     - 嗅探在路由规则里用 { "action": "sniff" } 而非 inbound 里的 sniff 字段
-#     - DNS 劫持用 { "protocol":"dns", "action":"hijack-dns" } 替代 dns-out
-#     - route 中有 default_domain_resolver 字段
-#
-# =============================================================
+# 生成 sing-box 1.11+ 客户端配置
 # =============================================================
 
 SINGBOX_CONFIG_DIR="/root/sing-box-config"
@@ -383,15 +808,10 @@ mkdir -p "${SINGBOX_CONFIG_DIR}"
 SINGBOX_CONFIG_FILE="${SINGBOX_CONFIG_DIR}/config_${CLIENT_OS}.json"
 
 # -----------------------------------------------------------------
-# 生成 inbounds JSON 片段
+# inbounds 生成（按客户端系统类型）
 # -----------------------------------------------------------------
 generate_inbounds() {
     case "$CLIENT_OS" in
-
-        # -----------------------------------------------------------
-        # iOS: 纯 TUN
-        # Network Extension 接管全部流量，不需要本地代理端口
-        # -----------------------------------------------------------
         ios)
             cat << EOF
     {
@@ -403,12 +823,6 @@ generate_inbounds() {
     }
 EOF
             ;;
-
-        # -----------------------------------------------------------
-        # macOS: TUN + mixed
-        # interface_name 指定虚拟网卡名，macOS 通常用 utun0
-        # mixed 入站供终端 export http_proxy / 浏览器手动代理
-        # -----------------------------------------------------------
         macos)
             cat << EOF
     {
@@ -427,11 +841,6 @@ EOF
     }
 EOF
             ;;
-
-        # -----------------------------------------------------------
-        # Android: 纯 TUN
-        # VPN Service API 系统级接管所有 App 流量
-        # -----------------------------------------------------------
         android)
             cat << EOF
     {
@@ -443,12 +852,6 @@ EOF
     }
 EOF
             ;;
-
-        # -----------------------------------------------------------
-        # Windows: TUN + mixed
-        # TUN 全局接管 + mixed 供 SwitchyOmega 等浏览器扩展
-        # 需管理员权限运行，WinTun 驱动会自动安装
-        # -----------------------------------------------------------
         windows)
             cat << EOF
     {
@@ -466,12 +869,6 @@ EOF
     }
 EOF
             ;;
-
-        # -----------------------------------------------------------
-        # Linux: TUN + mixed + tproxy
-        # mixed 供终端 export all_proxy 使用
-        # tproxy 端口 7893 供旁路由/网关 iptables 透明代理
-        # -----------------------------------------------------------
         linux)
             cat << EOF
     {
@@ -499,11 +896,10 @@ EOF
 }
 
 # -----------------------------------------------------------------
-# 生成 DNS 配置 (sing-box 1.11+ 语法)
+# DNS 生成（按路由模式）
 # -----------------------------------------------------------------
 generate_dns() {
     case "$ROUTE_MODE" in
-
         global)
             cat << 'EOF'
   "dns": {
@@ -520,7 +916,6 @@ generate_dns() {
   },
 EOF
             ;;
-
         split)
             cat << 'EOF'
   "dns": {
@@ -552,11 +947,10 @@ EOF
 }
 
 # -----------------------------------------------------------------
-# 生成 route 配置 (sing-box 1.11+ 语法)
+# route 生成（按路由模式）
 # -----------------------------------------------------------------
 generate_route() {
     case "$ROUTE_MODE" in
-
         global)
             cat << 'EOF'
   "route": {
@@ -571,7 +965,6 @@ generate_route() {
   }
 EOF
             ;;
-
         split)
             cat << 'EOF'
   "route": {
@@ -621,15 +1014,12 @@ log_step "生成 sing-box 客户端配置 (${CLIENT_OS} / ${ROUTE_MODE})..."
   },
 EOF
 
-    # DNS 配置
     generate_dns
 
-    # inbounds — 按客户端系统类型生成
     echo '  "inbounds": ['
     generate_inbounds
     echo '  ],'
 
-    # outbounds — 所有平台相同
     cat << EOF
   "outbounds": [
     {
@@ -655,14 +1045,13 @@ EOF
   ],
 EOF
 
-    # route — 按路由模式生成
     generate_route
 
     echo '}'
 
 } > "${SINGBOX_CONFIG_FILE}"
 
-# 用 python3 格式化 JSON（如果可用）
+# 用 python3 格式化 JSON
 if command -v python3 &> /dev/null; then
     python3 -m json.tool "${SINGBOX_CONFIG_FILE}" > "${SINGBOX_CONFIG_FILE}.tmp" 2>/dev/null \
         && mv "${SINGBOX_CONFIG_FILE}.tmp" "${SINGBOX_CONFIG_FILE}" \
@@ -705,16 +1094,58 @@ echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
 echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
 echo ""
 
-# ---- 2. VLESS 分享链接 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 2. VLESS 分享链接${NC}"
+# ---- 2. WARP 状态 ----
+if [ "$ENABLE_WARP" = true ]; then
+    echo -e "${BOLD}${MAGENTA}  ▶ 2. WARP 出口信息${NC}"
+    print_line
+    echo ""
+    echo -e "  WARP 状态   : ${GREEN}已启用${NC}"
+    echo -e "  SOCKS5 端口 : ${GREEN}127.0.0.1:${WARP_SOCKS_PORT}${NC}"
+    echo -e "  WARP 出口IP : ${GREEN}${WARP_IP:-未知}${NC}"
+    echo -e "  VPS  原始IP : ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  路由模式    : ${GREEN}${WARP_ROUTE_MODE}${NC}"
+    echo ""
+    echo -e "  ${CYAN}经过 WARP 的域名:${NC}"
+    case "$WARP_ROUTE_MODE" in
+        ai)
+            echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            ;;
+        ai+google)
+            echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Google  (google.com, youtube.com, ...)"
+            ;;
+        ai+google+netflix)
+            echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Google  (google.com, youtube.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Netflix (netflix.com, nflxvideo.net, ...)"
+            ;;
+        all)
+            echo -e "    ${GREEN}✓${NC} 全部出站流量"
+            ;;
+    esac
+    echo ""
+else
+    echo -e "${BOLD}${MAGENTA}  ▶ 2. WARP 状态${NC}"
+    print_line
+    echo ""
+    echo -e "  WARP 状态   : ${YELLOW}未启用${NC}"
+    echo -e "  所有流量通过 VPS IP (${SERVER_IP}) 直接出站"
+    echo ""
+fi
+
+# ---- 3. VLESS 分享链接 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 3. VLESS 分享链接${NC}"
 echo -e "${DIM}  可直接导入 v2rayN / v2rayNG / NekoBox / Shadowrocket${NC}"
 print_line
 echo ""
 echo -e "  ${GREEN}${VLESS_LINK}${NC}"
 echo ""
 
-# ---- 3. sing-box outbound 片段 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 3. sing-box outbound 配置片段${NC}"
+# ---- 4. sing-box outbound 片段 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 4. sing-box outbound 配置片段${NC}"
 print_line
 echo ""
 cat << EOF
@@ -740,8 +1171,8 @@ cat << EOF
 EOF
 echo ""
 
-# ---- 4. 完整 sing-box JSON 配置 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 4. sing-box 完整客户端配置 [${CLIENT_OS} / ${ROUTE_MODE}]${NC}"
+# ---- 5. 完整 sing-box 配置 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 5. sing-box 完整客户端配置 [${CLIENT_OS} / ${ROUTE_MODE}]${NC}"
 echo -e "  ${YELLOW}文件路径: ${SINGBOX_CONFIG_FILE}${NC}"
 print_line
 echo ""
@@ -750,8 +1181,18 @@ echo ""
 print_line
 echo ""
 
-# ---- 5. 平台特定使用说明 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 5. ${CLIENT_OS} 平台使用说明${NC}"
+# ---- 6. Xray 服务端配置 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 6. Xray 服务端配置${NC}"
+echo -e "  ${YELLOW}文件路径: /usr/local/etc/xray/config.json${NC}"
+print_line
+echo ""
+cat /usr/local/etc/xray/config.json
+echo ""
+print_line
+echo ""
+
+# ---- 7. 平台使用说明 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 7. ${CLIENT_OS} 平台使用说明${NC}"
 print_line
 echo ""
 case "$CLIENT_OS" in
@@ -760,14 +1201,12 @@ case "$CLIENT_OS" in
         echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 中新建配置粘贴"
         echo -e "           或使用 VLESS 分享链接直接导入"
         echo -e "  ${CYAN}工作原理 :${NC} 系统通过 Network Extension 将全部流量交给 TUN 接口"
-        echo -e "           无需手动设置系统代理，开启即全局生效"
         ;;
     macos)
         echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box macOS (SFI)${NC}"
         echo -e "  ${CYAN}TUN 入站 :${NC} 使用 utun0 虚拟网卡接管全局流量"
         echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
         echo -e "           终端使用: ${GREEN}export https_proxy=http://127.0.0.1:2080${NC}"
-        echo -e "           浏览器可用 SwitchyOmega 指向此端口"
         echo -e "  ${CYAN}首次运行 :${NC} 需在 系统设置 → 隐私与安全性 → VPN 中授权"
         ;;
     android)
@@ -775,37 +1214,38 @@ case "$CLIENT_OS" in
         echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 新建配置粘贴"
         echo -e "           或使用 VLESS 分享链接直接导入"
         echo -e "  ${CYAN}工作原理 :${NC} 通过 Android VPN Service 创建虚拟网卡"
-        echo -e "           系统级接管所有 App 流量，可在 App 中设置分应用代理"
         ;;
     windows)
         echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Windows / v2rayN / NekoRay${NC}"
         echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管系统流量（需管理员权限运行）"
         echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
-        echo -e "           浏览器可配合 SwitchyOmega 扩展使用"
         echo -e "  ${CYAN}注意事项 :${NC} 首次运行会自动安装 WinTun 网卡驱动"
-        echo -e "           如 TUN 模式异常可先用 Mixed 代理模式"
         ;;
     linux)
         echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box CLI${NC}"
         echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管流量（需 root / CAP_NET_ADMIN）"
-        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
-        echo -e "           终端: ${GREEN}export all_proxy=socks5://127.0.0.1:2080${NC}"
-        echo -e "  ${CYAN}TProxy   :${NC} 端口 7893，供旁路由/网关做透明代理"
-        echo -e "           配合 iptables/nftables 将局域网流量转发到此端口"
+        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080  终端: ${GREEN}export all_proxy=socks5://127.0.0.1:2080${NC}"
+        echo -e "  ${CYAN}TProxy   :${NC} 端口 7893 供旁路由/网关透明代理"
         echo -e "  ${CYAN}启动命令 :${NC} ${GREEN}sudo sing-box run -c ${SINGBOX_CONFIG_FILE}${NC}"
         ;;
 esac
 echo ""
 
-# ---- 6. 常用命令 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 6. 服务器常用命令${NC}"
+# ---- 8. 常用命令 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 8. 服务器常用命令${NC}"
 print_line
 echo ""
-echo -e "  ${CYAN}查看 Xray 状态  :${NC} ${GREEN}systemctl status xray${NC}"
-echo -e "  ${CYAN}查看 Xray 日志  :${NC} ${GREEN}journalctl -u xray -f${NC}"
-echo -e "  ${CYAN}重启 Xray       :${NC} ${GREEN}systemctl restart xray${NC}"
-echo -e "  ${CYAN}下载配置到本地  :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_FILE} ./config.json${NC}"
-echo -e "  ${CYAN}重新查看配置    :${NC} ${GREEN}cat ${SINGBOX_CONFIG_FILE}${NC}"
+echo -e "  ${CYAN}Xray 状态      :${NC} ${GREEN}systemctl status xray${NC}"
+echo -e "  ${CYAN}Xray 日志      :${NC} ${GREEN}journalctl -u xray -f${NC}"
+echo -e "  ${CYAN}重启 Xray      :${NC} ${GREEN}systemctl restart xray${NC}"
+echo -e "  ${CYAN}Xray 服务端配置:${NC} ${GREEN}cat /usr/local/etc/xray/config.json${NC}"
+if [ "$ENABLE_WARP" = true ]; then
+    echo -e "  ${CYAN}WARP 状态      :${NC} ${GREEN}warp-cli status${NC}"
+    echo -e "  ${CYAN}WARP 重连      :${NC} ${GREEN}warp-cli disconnect && warp-cli connect${NC}"
+    echo -e "  ${CYAN}测试 WARP IP   :${NC} ${GREEN}curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me${NC}"
+fi
+echo -e "  ${CYAN}下载客户端配置 :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_FILE} ./config.json${NC}"
+echo -e "  ${CYAN}查看客户端配置 :${NC} ${GREEN}cat ${SINGBOX_CONFIG_FILE}${NC}"
 echo ""
 print_dline
 echo -e "${BOLD}${RED}  ⚠  请将以上所有信息保存好，私钥不会再次显示！${NC}"
