@@ -57,6 +57,42 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # =============================================================
+# 系统更新与依赖安装
+# =============================================================
+# 很多 VPS 刚开出来的镜像是几个月前的快照，包索引过期、
+# 软件版本陈旧，容易引发后续安装失败（例如缺少 unzip
+# 导致 Xray 安装报错，或旧版 libssl 导致 WARP 安装失败）。
+# 所以在最开始就做一次完整的系统更新。
+# =============================================================
+log_step "更新系统软件包..."
+
+if command -v apt-get &> /dev/null; then
+    # Debian / Ubuntu 系
+    apt-get update -y
+    log_info "包索引已更新"
+    apt-get upgrade -y
+    log_info "系统软件包已升级"
+    apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release
+elif command -v yum &> /dev/null; then
+    # CentOS / RHEL 系
+    yum update -y
+    yum install -y unzip curl openssl wget ca-certificates gnupg2
+elif command -v dnf &> /dev/null; then
+    # Fedora / 新版 RHEL 系
+    dnf update -y
+    dnf install -y unzip curl openssl wget ca-certificates gnupg2
+elif command -v apk &> /dev/null; then
+    # Alpine
+    apk update && apk upgrade
+    apk add --no-cache unzip curl openssl wget ca-certificates gnupg
+else
+    log_warn "未识别的包管理器，请确保系统已更新且已安装: unzip curl openssl wget"
+fi
+
+log_info "系统更新与依赖安装完成"
+echo ""
+
+# =============================================================
 # 欢迎界面
 # =============================================================
 clear
@@ -274,33 +310,6 @@ fi
 echo ""
 log_info "开始部署..."
 echo ""
-
-# =============================================================
-# 安装系统依赖
-# =============================================================
-# Xray 安装脚本需要 unzip 来解压 release 包，curl 用于下载，
-# openssl 用于生成 Short ID。很多精简版 VPS 镜像不预装这些工具，
-# 如果缺失会导致后续步骤报错，所以在这里统一安装一遍。
-log_step "安装系统依赖 (unzip, curl, openssl, wget)..."
-
-if command -v apt-get &> /dev/null; then
-    # Debian / Ubuntu 系
-    apt-get update -y
-    apt-get install -y unzip curl openssl wget ca-certificates
-elif command -v yum &> /dev/null; then
-    # CentOS / RHEL 系
-    yum install -y unzip curl openssl wget ca-certificates
-elif command -v dnf &> /dev/null; then
-    # Fedora / 新版 RHEL 系
-    dnf install -y unzip curl openssl wget ca-certificates
-elif command -v apk &> /dev/null; then
-    # Alpine
-    apk add --no-cache unzip curl openssl wget ca-certificates
-else
-    log_warn "未识别的包管理器，请确保已安装: unzip curl openssl wget"
-fi
-
-log_info "系统依赖安装完成"
 
 # =============================================================
 # 安装 Xray
