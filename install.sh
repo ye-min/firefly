@@ -1,19 +1,24 @@
 #!/bin/bash
 
 # =============================================================
-# Xray 一键部署脚本 (增强版 v4 — 含 WARP)
+# Xray 一键部署脚本
 # 协议: VLESS + Reality + XTLS Vision
-# sing-box 配置语法: 1.11+
+# sing-box 客户端配置语法: 1.11+
 #
-# 功能:
-#   1. 部署 Xray VLESS+Reality 服务端
-#   2. 安装 Cloudflare WARP 并配置 SOCKS5 代理出口
-#   3. Xray 路由规则: ChatGPT / Claude 流量走 WARP 出口
-#   4. 选择客户端系统类型 (iOS/macOS/Android/Windows/Linux)
-#   5. 选择 TLS 指纹（根据系统自动推荐）
-#   6. 选择路由模式（全局 / 国内外分流）
-#   7. 终端完整显示 sing-box 客户端 JSON + 保存文件
-#   8. 生成 VLESS 分享链接
+# 版本: 1.0.0
+# 日期: 2026-03-17
+# 仓库: https://github.com/your-repo/xray-reality-setup
+#
+# 更新日志:
+#   v1.0.0  2026-03-17  首个正式版本
+#     - 一键部署 Xray VLESS+Reality 服务端
+#     - Cloudflare WARP 集成 (ChatGPT/Claude/Google/Netflix)
+#     - 客户端系统选择 (iOS/macOS/Android/Windows/Linux)
+#     - TLS 指纹选择（根据系统自动推荐）
+#     - 路由模式选择（全局代理 / 国内外分流）
+#     - 生成完整 sing-box 1.11+ 客户端 JSON 配置
+#     - 生成 VLESS 分享链接
+#     - 系统依赖自动安装 (apt/yum/dnf/apk)
 #
 # WARP 工作原理:
 #   VPS 上安装 Cloudflare WARP 客户端后，它会在本地开一个
@@ -26,6 +31,10 @@
 #     客户端 → Xray(VPS) → WARP SOCKS5 → Cloudflare网络 → 目标网站
 #                         ↘ 其他流量直接出去 (freedom)
 # =============================================================
+
+# ---- 版本信息 ----
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DATE="2026-03-17"
 
 set -e
 
@@ -98,8 +107,9 @@ echo ""
 clear
 echo ""
 print_dline
-echo -e "${BOLD}${MAGENTA}     Xray VLESS + Reality 一键部署 (v4)${NC}"
+echo -e "${BOLD}${MAGENTA}     Xray VLESS + Reality 一键部署${NC}"
 echo -e "${DIM}     含 Cloudflare WARP · sing-box 1.11+ 语法${NC}"
+echo -e "${DIM}     版本 ${SCRIPT_VERSION}  (${SCRIPT_DATE})${NC}"
 print_dline
 echo ""
 log_warn "以下信息将写入服务端配置，请准确填写"
@@ -1156,6 +1166,7 @@ echo ""
 echo ""
 print_dline
 echo -e "${BOLD}${GREEN}              部署完成！${NC}"
+echo -e "${DIM}              v${SCRIPT_VERSION}  (${SCRIPT_DATE})${NC}"
 print_dline
 
 # ---- 1. 通用客户端参数 ----
