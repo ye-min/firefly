@@ -990,14 +990,14 @@ generate_dns() {
   "dns": {
     "servers": [
       {
-        "type": "tls",
+        "type": "https",
         "tag": "dns-remote",
         "server": "8.8.8.8",
         "detour": "proxy"
       }
     ],
     "final": "dns-remote",
-    "strategy": "prefer_ipv4"
+    "strategy": "ipv4_only"
   },
 EOF
             ;;
@@ -1024,7 +1024,7 @@ EOF
       }
     ],
     "final": "dns-remote",
-    "strategy": "prefer_ipv4"
+    "strategy": "ipv4_only"
   },
 EOF
             ;;
@@ -1033,6 +1033,7 @@ EOF
 
 # -----------------------------------------------------------------
 # route 生成（按路由模式）
+# 严格按照实际可工作的 sing-box 1.11+ 配置模板
 # -----------------------------------------------------------------
 generate_route() {
     case "$ROUTE_MODE" in
@@ -1041,8 +1042,7 @@ generate_route() {
   "route": {
     "rules": [
       { "action": "sniff" },
-      { "protocol": "dns", "action": "hijack-dns" },
-      { "ip_is_private": true, "outbound": "direct" }
+      { "protocol": "dns", "action": "hijack-dns" }
     ],
     "final": "proxy",
     "auto_detect_interface": true,
@@ -1056,7 +1056,6 @@ EOF
     "rules": [
       { "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
-      { "ip_is_private": true, "outbound": "direct" },
       { "rule_set": "geoip-cn", "outbound": "direct" },
       { "rule_set": "geosite-cn", "outbound": "direct" }
     ],
