@@ -55,7 +55,7 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()    { echo -e "${CYAN}[STEP]${NC} $1"; }
 
 print_line()  { echo -e "${BLUE}=============================================${NC}"; }
-print_dline() { echo -e "${BLUE}==============================================${NC}"; }
+print_dline() { echo -e "${BLUE}=============================================${NC}"; }
 
 # =============================================================
 # 检查 root 权限
@@ -79,17 +79,19 @@ if command -v apt-get &> /dev/null; then
     # Debian / Ubuntu 系
     apt-get update -y
     log_info "包索引已更新"
-    apt-get upgrade -y
+    # upgrade 遇到包冲突时可能非零退出，不应中断脚本
+    apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || \
+        log_warn "系统软件包升级过程中有警告，继续执行..."
     log_info "系统软件包已升级"
     apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release
-elif command -v yum &> /dev/null; then
-    # CentOS / RHEL 系
-    yum update -y
-    yum install -y unzip curl openssl wget ca-certificates gnupg2
 elif command -v dnf &> /dev/null; then
-    # Fedora / 新版 RHEL 系
+    # Fedora / 新版 RHEL 系（dnf 优先于 yum，因为 yum 在 RHEL8+ 仅是 dnf 的别名）
     dnf update -y
     dnf install -y unzip curl openssl wget ca-certificates gnupg2
+elif command -v yum &> /dev/null; then
+    # CentOS / RHEL 旧版
+    yum update -y
+    yum install -y unzip curl openssl wget ca-certificates gnupg2
 elif command -v apk &> /dev/null; then
     # Alpine
     apk update && apk upgrade
@@ -176,8 +178,15 @@ done
 WARP_SOCKS_PORT=40000
 if [ "$ENABLE_WARP" = true ]; then
     log_info "已选择启用 WARP"
-    read -p "$(echo -e ${CYAN}'WARP SOCKS5 本地端口（直接回车使用默认 40000）: '${NC})" WARP_PORT_INPUT
-    WARP_SOCKS_PORT=${WARP_PORT_INPUT:-40000}
+    while true; do
+        read -p "$(echo -e ${CYAN}'WARP SOCKS5 本地端口（直接回车使用默认 40000）: '${NC})" WARP_PORT_INPUT
+        WARP_SOCKS_PORT=${WARP_PORT_INPUT:-40000}
+        if [[ "$WARP_SOCKS_PORT" =~ ^[0-9]+$ ]] && [ "$WARP_SOCKS_PORT" -ge 1 ] && [ "$WARP_SOCKS_PORT" -le 65535 ]; then
+            break
+        else
+            log_error "端口号必须在 1-65535 之间"
+        fi
+    done
 
     # 询问需要走 WARP 的服务
     echo ""
@@ -370,7 +379,11 @@ if [ "$ENABLE_WARP" = true ]; then
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS_ID="$ID"
-        OS_VERSION="$VERSION_CODENAME"
+        # VERSION_CODENAME 在部分最小化镜像中可能为空，回退到 lsb_release
+        OS_VERSION="${VERSION_CODENAME:-}"
+        if [ -z "$OS_VERSION" ] && command -v lsb_release &> /dev/null; then
+            OS_VERSION=$(lsb_release -cs 2>/dev/null || true)
+        fi
     fi
 
     # 安装 WARP 客户端
@@ -380,20 +393,34 @@ if [ "$ENABLE_WARP" = true ]; then
 
         case "$OS_ID" in
             ubuntu|debian)
-                # 添加 Cloudflare GPG key 和仓库
-                curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-                    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+                if [ -z "$OS_VERSION" ]; then
+                    log_error "无法获取系统版本代号（VERSION_CODENAME 为空），请手动安装 cloudflare-warp"
+                    log_warn "跳过 WARP 安装，其他配置将继续..."
+                    ENABLE_WARP=false
+                else
+                    # 添加 Cloudflare GPG key 和仓库
+                    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+                        | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
-                echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${OS_VERSION} main" \
-                    > /etc/apt/sources.list.d/cloudflare-client.list
+                    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${OS_VERSION} main" \
+                        > /etc/apt/sources.list.d/cloudflare-client.list
 
-                apt-get update
-                apt-get install -y cloudflare-warp
+                    apt-get update
+                    apt-get install -y cloudflare-warp
+                fi
                 ;;
             centos|rhel|rocky|almalinux|fedora)
-                rpm -ivh "https://pkg.cloudflareclient.com/cloudflare-release-el$(rpm -E %rhel).rpm" 2>/dev/null \
-                    || rpm -ivh "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
-                yum install -y cloudflare-warp || dnf install -y cloudflare-warp
+                # 使用包管理器安装 repo 包，自动处理依赖关系
+                RHEL_VER=$(rpm -E %rhel 2>/dev/null || echo "8")
+                if command -v dnf &> /dev/null; then
+                    dnf install -y "https://pkg.cloudflareclient.com/cloudflare-release-el${RHEL_VER}.rpm" 2>/dev/null \
+                        || dnf install -y "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
+                    dnf install -y cloudflare-warp
+                else
+                    yum install -y "https://pkg.cloudflareclient.com/cloudflare-release-el${RHEL_VER}.rpm" 2>/dev/null \
+                        || yum install -y "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
+                    yum install -y cloudflare-warp
+                fi
                 ;;
             *)
                 log_error "不支持的系统: ${OS_ID}，请手动安装 cloudflare-warp"
@@ -426,11 +453,10 @@ if [ "$ENABLE_WARP" = true ]; then
         done
 
         # 注册 WARP
-        # 判断是否已经注册：检查 status 里是否包含 "Registration Missing"
-        # 注意: 不能用 grep "Registration" 来判断，因为
-        # "Registration Missing" 也包含这个词，会导致误判为已注册
+        # 判断是否已经注册：精确匹配 "Registration Missing" 或 "Unable to"，
+        # 避免 "Missing" 单独匹配到其他无关状态消息
         WARP_STATUS_CHECK=$(warp-cli --accept-tos status 2>&1 || true)
-        if echo "$WARP_STATUS_CHECK" | grep -qi "Registration Missing\|Missing\|Unable"; then
+        if echo "$WARP_STATUS_CHECK" | grep -qi "Registration Missing\|Unable to"; then
             log_info "注册 WARP..."
             warp-cli --accept-tos registration new
             sleep 3
@@ -455,9 +481,9 @@ if [ "$ENABLE_WARP" = true ]; then
         warp-cli --accept-tos mode proxy
         warp-cli --accept-tos proxy port ${WARP_SOCKS_PORT}
 
-        # 连接 WARP
+        # 连接 WARP（连接失败不应立即中断脚本，下方重试循环会检测连接状态）
         log_info "连接 WARP..."
-        warp-cli --accept-tos connect
+        warp-cli --accept-tos connect || true
 
         # 等待连接建立（使用重试循环，最多等 30 秒）
         # WARP 连接需要与 Cloudflare 边缘服务器建立 WireGuard 隧道，
@@ -900,15 +926,31 @@ fi
 
 SINGBOX_CONFIG_DIR="/root/sing-box-config"
 mkdir -p "${SINGBOX_CONFIG_DIR}"
-SINGBOX_CONFIG_FILE="${SINGBOX_CONFIG_DIR}/config_${CLIENT_OS}.json"
 
 # -----------------------------------------------------------------
-# inbounds 生成（按客户端系统类型）
+# 各 OS 的默认 TLS 指纹
+# 用法: get_default_fp <os>
+# -----------------------------------------------------------------
+get_default_fp() {
+    case "$1" in
+        ios)     echo "safari"  ;;
+        macos)   echo "chrome"  ;;
+        android) echo "chrome"  ;;
+        windows) echo "chrome"  ;;
+        linux)   echo "firefox" ;;
+        *)       echo "chrome"  ;;
+    esac
+}
+
+# -----------------------------------------------------------------
+# inbounds 生成
+# 用法: generate_inbounds <os>
 # -----------------------------------------------------------------
 generate_inbounds() {
-    case "$CLIENT_OS" in
+    local os="$1"
+    case "$os" in
         ios)
-            cat << EOF
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -919,7 +961,7 @@ generate_inbounds() {
 EOF
             ;;
         macos)
-            cat << EOF
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -937,7 +979,7 @@ EOF
 EOF
             ;;
         android)
-            cat << EOF
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -948,7 +990,7 @@ EOF
 EOF
             ;;
         windows)
-            cat << EOF
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -965,7 +1007,7 @@ EOF
 EOF
             ;;
         linux)
-            cat << EOF
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -991,10 +1033,12 @@ EOF
 }
 
 # -----------------------------------------------------------------
-# DNS 生成（按路由模式）
+# DNS 生成
+# 用法: generate_dns <route_mode>
 # -----------------------------------------------------------------
 generate_dns() {
-    case "$ROUTE_MODE" in
+    local mode="$1"
+    case "$mode" in
         global)
             cat << 'EOF'
   "dns": {
@@ -1042,11 +1086,13 @@ EOF
 }
 
 # -----------------------------------------------------------------
-# route 生成（按路由模式）
+# route 生成
 # 严格按照实际可工作的 sing-box 1.11+ 配置模板
+# 用法: generate_route <route_mode>
 # -----------------------------------------------------------------
 generate_route() {
-    case "$ROUTE_MODE" in
+    local mode="$1"
+    case "$mode" in
         global)
             cat << 'EOF'
   "route": {
@@ -1095,26 +1141,30 @@ EOF
 }
 
 # -----------------------------------------------------------------
-# 组装完整 sing-box 客户端配置
+# 组装并写入单个 sing-box 客户端配置
+# 用法: generate_singbox_config <os> <route_mode> <fingerprint> <output_file>
 # -----------------------------------------------------------------
-log_step "生成 sing-box 客户端配置 (${CLIENT_OS} / ${ROUTE_MODE})..."
+generate_singbox_config() {
+    local os="$1"
+    local mode="$2"
+    local fp="$3"
+    local outfile="$4"
 
-{
-    cat << EOF
+    {
+        cat << EOF
 {
   "log": {
     "level": "info",
     "timestamp": true
   },
 EOF
+        generate_dns "$mode"
 
-    generate_dns
+        echo '  "inbounds": ['
+        generate_inbounds "$os"
+        echo '  ],'
 
-    echo '  "inbounds": ['
-    generate_inbounds
-    echo '  ],'
-
-    cat << EOF
+        cat << EOF
   "outbounds": [
     {
       "type": "vless",
@@ -1127,7 +1177,7 @@ EOF
       "tls": {
         "enabled": true,
         "server_name": "${INPUT_SNI}",
-        "utls": { "enabled": true, "fingerprint": "${CLIENT_FINGERPRINT}" },
+        "utls": { "enabled": true, "fingerprint": "${fp}" },
         "reality": {
           "enabled": true,
           "public_key": "${PUBLIC_KEY}",
@@ -1138,21 +1188,41 @@ EOF
     { "type": "direct", "tag": "direct" }
   ],
 EOF
+        generate_route "$mode"
 
-    generate_route
+        echo '}'
+    } > "$outfile"
 
-    echo '}'
+    # 用 python3 格式化并验证 JSON
+    if command -v python3 &> /dev/null; then
+        if python3 -m json.tool "$outfile" > "$outfile.tmp" 2>/dev/null; then
+            mv "$outfile.tmp" "$outfile"
+        else
+            rm -f "$outfile.tmp"
+            log_warn "JSON 格式验证失败，请手动检查: $outfile"
+        fi
+    fi
+}
 
-} > "${SINGBOX_CONFIG_FILE}"
+# -----------------------------------------------------------------
+# 生成全部客户端配置（5 OS × 2 路由模式 = 10 个文件）
+# -----------------------------------------------------------------
+ALL_OS_LIST=(ios macos android windows linux)
+ALL_ROUTE_LIST=(global split)
 
-# 用 python3 格式化 JSON
-if command -v python3 &> /dev/null; then
-    python3 -m json.tool "${SINGBOX_CONFIG_FILE}" > "${SINGBOX_CONFIG_FILE}.tmp" 2>/dev/null \
-        && mv "${SINGBOX_CONFIG_FILE}.tmp" "${SINGBOX_CONFIG_FILE}" \
-        || rm -f "${SINGBOX_CONFIG_FILE}.tmp"
-fi
+log_step "生成全部 sing-box 客户端配置..."
+for _os in "${ALL_OS_LIST[@]}"; do
+    _fp=$(get_default_fp "$_os")
+    for _mode in "${ALL_ROUTE_LIST[@]}"; do
+        _outfile="${SINGBOX_CONFIG_DIR}/config_${_os}_${_mode}.json"
+        generate_singbox_config "$_os" "$_mode" "$_fp" "$_outfile"
+        log_info "  已生成: config_${_os}_${_mode}.json"
+    done
+done
 
-log_info "sing-box 客户端配置已保存至: ${SINGBOX_CONFIG_FILE}"
+# 当前会话选定的配置（供后续输出引用）
+SINGBOX_CONFIG_FILE="${SINGBOX_CONFIG_DIR}/config_${CLIENT_OS}_${ROUTE_MODE}.json"
+log_info "全部配置已保存至目录: ${SINGBOX_CONFIG_DIR}/"
 
 # =============================================================
 # 生成 VLESS 分享链接
@@ -1266,12 +1336,42 @@ cat << EOF
 EOF
 echo ""
 
-# ---- 5. 完整 sing-box 配置 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 5. sing-box 完整客户端配置 [${CLIENT_OS} / ${ROUTE_MODE}]${NC}"
-echo -e "  ${YELLOW}文件路径: ${SINGBOX_CONFIG_FILE}${NC}"
+# ---- 5. 全部客户端配置文件列表 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 5. sing-box 客户端配置文件（全平台）${NC}"
+echo -e "  ${DIM}目录: ${SINGBOX_CONFIG_DIR}/${NC}"
 print_line
 echo ""
-cat "${SINGBOX_CONFIG_FILE}"
+
+_OS_LABELS=(
+    "ios     → sing-box iOS / Stash / Shadowrocket"
+    "macos   → sing-box macOS / V2rayU"
+    "android → sing-box Android / NekoBox / v2rayNG"
+    "windows → sing-box Windows / v2rayN / NekoRay"
+    "linux   → sing-box CLI / 旁路由网关"
+)
+_ROUTE_LABELS=(
+    "global  全局代理（所有流量走代理）"
+    "split   分流模式（国内直连 / 国外代理）"
+)
+
+for _os in "${ALL_OS_LIST[@]}"; do
+    # 找到对应的标签说明
+    _label=""
+    for _l in "${_OS_LABELS[@]}"; do
+        if [[ "$_l" == "${_os}"* ]]; then _label="$_l"; break; fi
+    done
+    echo -e "  ${CYAN}${_label}${NC}"
+    for _mode in "${ALL_ROUTE_LIST[@]}"; do
+        _f="${SINGBOX_CONFIG_DIR}/config_${_os}_${_mode}.json"
+        _size=$(wc -c < "$_f" 2>/dev/null || echo "?")
+        printf "    ${GREEN}%-40s${NC}  ${DIM}%s bytes${NC}\n" "config_${_os}_${_mode}.json" "$_size"
+        echo -e "    ${DIM}scp root@${SERVER_IP}:${_f} ./config_${_os}_${_mode}.json${NC}"
+    done
+    echo ""
+done
+
+echo -e "  ${YELLOW}一次性下载全部配置到本地当前目录:${NC}"
+echo -e "  ${GREEN}scp -r root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/ ./sing-box-configs/${NC}"
 echo ""
 print_line
 echo ""
@@ -1339,8 +1439,9 @@ if [ "$ENABLE_WARP" = true ]; then
     echo -e "  ${CYAN}WARP 重连      :${NC} ${GREEN}warp-cli disconnect && warp-cli connect${NC}"
     echo -e "  ${CYAN}测试 WARP IP   :${NC} ${GREEN}curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me${NC}"
 fi
-echo -e "  ${CYAN}下载客户端配置 :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_FILE} ./config.json${NC}"
-echo -e "  ${CYAN}查看客户端配置 :${NC} ${GREEN}cat ${SINGBOX_CONFIG_FILE}${NC}"
+echo -e "  ${CYAN}下载全部配置   :${NC} ${GREEN}scp -r root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/ ./sing-box-configs/${NC}"
+echo -e "  ${CYAN}下载单个配置   :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/config_<os>_<mode>.json ./${NC}"
+echo -e "  ${CYAN}查看配置目录   :${NC} ${GREEN}ls -lh ${SINGBOX_CONFIG_DIR}/${NC}"
 echo ""
 print_dline
 echo -e "${BOLD}${RED}  ⚠  请将以上所有信息保存好，私钥不会再次显示！${NC}"
