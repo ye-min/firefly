@@ -192,10 +192,10 @@ if [ "$ENABLE_WARP" = true ]; then
     echo ""
     echo -e "  ${BOLD}选择需要走 WARP 出口的服务:${NC}"
     echo ""
-    echo -e "  ${GREEN}1)${NC} ChatGPT + Claude          ${YELLOW}← 推荐${NC}"
-    echo -e "  ${GREEN}2)${NC} ChatGPT + Claude + Google"
-    echo -e "  ${GREEN}3)${NC} ChatGPT + Claude + Google + Netflix"
-    echo -e "  ${GREEN}4)${NC} 全部流量走 WARP           ${DIM}(所有出站都经过 Cloudflare)${NC}"
+    echo -e "  ${GREEN}1)${NC} ChatGPT + Claude + Apple          ${YELLOW}← 推荐${NC}"
+    echo -e "  ${GREEN}2)${NC} ChatGPT + Claude + Apple + Google"
+    echo -e "  ${GREEN}3)${NC} ChatGPT + Claude + Apple + Google + Netflix"
+    echo -e "  ${GREEN}4)${NC} 全部流量走 WARP                   ${DIM}(所有出站都经过 Cloudflare)${NC}"
     echo ""
 
     while true; do
@@ -610,6 +610,16 @@ NETFLIX_DOMAINS=(
     "nflxso.net"
 )
 
+# Apple 相关域名（账号注册 / iCloud / App Store）
+APPLE_DOMAINS=(
+    "apple.com"
+    "icloud.com"
+    "mzstatic.com"
+    "cdn-apple.com"
+    "apple-cloudkit.com"
+    "icloud-content.com"
+)
+
 # =============================================================
 # 根据用户选择组装 WARP 域名路由规则
 # =============================================================
@@ -618,9 +628,10 @@ build_warp_domain_rules() {
     local ALL_WARP_DOMAINS=()
 
     if [ "$ENABLE_WARP" = true ]; then
-        # ChatGPT + Claude 始终包含
+        # ChatGPT + Claude + Apple 始终包含（模式 1/2/3 均含 Apple）
         ALL_WARP_DOMAINS+=("${OPENAI_DOMAINS[@]}")
         ALL_WARP_DOMAINS+=("${CLAUDE_DOMAINS[@]}")
+        ALL_WARP_DOMAINS+=("${APPLE_DOMAINS[@]}")
 
         # 根据选择追加 Google
         if [[ "$WARP_ROUTE_MODE" == "ai+google" || "$WARP_ROUTE_MODE" == "ai+google+netflix" ]]; then
@@ -1275,15 +1286,18 @@ if [ "$ENABLE_WARP" = true ]; then
         ai)
             echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
             echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Apple   (apple.com, icloud.com, ...)"
             ;;
         ai+google)
             echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
             echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Apple   (apple.com, icloud.com, ...)"
             echo -e "    ${GREEN}✓${NC} Google  (google.com, youtube.com, ...)"
             ;;
         ai+google+netflix)
             echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
             echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Apple   (apple.com, icloud.com, ...)"
             echo -e "    ${GREEN}✓${NC} Google  (google.com, youtube.com, ...)"
             echo -e "    ${GREEN}✓${NC} Netflix (netflix.com, nflxvideo.net, ...)"
             ;;
