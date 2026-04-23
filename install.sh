@@ -338,13 +338,12 @@ bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-rele
 log_info "Xray 安装完成"
 
 # ---- 生成密钥对 ----
-# xray x25519 输出格式:
-#   PrivateKey: xxxx
-#   Password: xxxx    ← 这就是 Public Key，xray 把它叫 Password
-#   Hash32: xxxx
+# xray x25519 输出格式 (现代版本):
+#   Private key: xxxx
+#   Public key:  xxxx
 KEYPAIR=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYPAIR" | grep PrivateKey | awk '{print $2}')
-PUBLIC_KEY=$(echo "$KEYPAIR" | grep Password | awk '{print $2}')
+PRIVATE_KEY=$(echo "$KEYPAIR" | grep "Private key" | awk '{print $3}')
+PUBLIC_KEY=$(echo "$KEYPAIR" | grep "Public key" | awk '{print $3}')
 
 # ---- 生成 Short ID ----
 SHORT_ID=$(openssl rand -hex 8)
