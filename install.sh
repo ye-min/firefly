@@ -341,9 +341,17 @@ log_info "Xray 安装完成"
 # xray x25519 输出格式 (现代版本):
 #   Private key: xxxx
 #   Public key:  xxxx
+# 使用 sed 提取冒号后的内容并去除首尾空白，兼容不同版本的输出格式
 KEYPAIR=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYPAIR" | grep "Private key" | awk '{print $3}')
-PUBLIC_KEY=$(echo "$KEYPAIR" | grep "Public key" | awk '{print $3}')
+PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private" | sed 's/.*:[[:space:]]*//')
+PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "public" | sed 's/.*:[[:space:]]*//')
+
+# 验证密钥不为空
+if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+    log_error "密钥对生成失败，请检查 xray x25519 输出:"
+    echo "$KEYPAIR"
+    exit 1
+fi
 
 # ---- 生成 Short ID ----
 SHORT_ID=$(openssl rand -hex 8)
