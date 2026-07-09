@@ -357,9 +357,11 @@ fi
 SHORT_ID=$(openssl rand -hex 8)
 
 # ---- 获取服务器 IP ----
-SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null \
-         || curl -s --max-time 5 ip.sb 2>/dev/null \
-         || curl -s --max-time 5 ipinfo.io/ip 2>/dev/null \
+# 强制 IPv4：服务端监听 0.0.0.0（仅 IPv4），且 IPv6 地址写入
+# VLESS 链接时需要加方括号，统一取 IPv4 避免生成不可用的配置
+SERVER_IP=$(curl -4s --max-time 5 ifconfig.me 2>/dev/null \
+         || curl -4s --max-time 5 ip.sb 2>/dev/null \
+         || curl -4s --max-time 5 ipinfo.io/ip 2>/dev/null \
          || echo "YOUR_SERVER_IP")
 
 echo ""
@@ -1231,6 +1233,8 @@ ALL_ROUTE_LIST=(global split)
 log_step "生成全部 sing-box 客户端配置..."
 for _os in "${ALL_OS_LIST[@]}"; do
     _fp=$(get_default_fp "$_os")
+    # 用户选定的系统使用交互时选择的指纹，与 VLESS 分享链接保持一致
+    [ "$_os" = "$CLIENT_OS" ] && _fp="$CLIENT_FINGERPRINT"
     for _mode in "${ALL_ROUTE_LIST[@]}"; do
         _outfile="${SINGBOX_CONFIG_DIR}/config_${_os}_${_mode}.json"
         generate_singbox_config "$_os" "$_mode" "$_fp" "$_outfile"
