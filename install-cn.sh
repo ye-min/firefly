@@ -1,414 +1,683 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# =============================================================================
-# 中国大陆网站回国代理部署脚本
+# =============================================================
+# Xray 中国大陆网站回国代理一键部署脚本
+# 协议: VLESS + Reality + XTLS Vision
+# sing-box 客户端配置语法: 1.13.14
 #
-# 服务端：Xray VLESS + REALITY + XTLS Vision
-# 客户端：sing-box 1.13.x
+# 版本: 1.0.0-cn
+# 日期: 2026-07-21
+# 仓库: https://github.com/your-repo/xray-reality-setup
 #
-# 路由目标：
-#   中国大陆域名/IP -> VLESS -> 中国大陆 VPS -> 目标网站
-#   其他流量         -> 客户端本地直连
-#
-# 本脚本刻意不安装、不配置 Cloudflare WARP，以确保目标网站看到的是
-# 中国大陆 VPS 的原始公网出口，而不是 Cloudflare 共享出口。
-# =============================================================================
+# 本脚本以 install.sh 为母版，仅针对回国访问修改：
+#   - 不安装、不使用 Cloudflare WARP
+#   - 中国大陆域名/IP 经大陆 VPS 代理
+#   - 其他流量由美国客户端本地直连
+#   - 生成 sing-box 1.13.14 客户端配置
+# =============================================================
 
-set -Eeuo pipefail
-
-SCRIPT_VERSION="1.0.1"
+# ---- 版本信息 ----
+SCRIPT_VERSION="1.0.0-cn"
 SCRIPT_DATE="2026-07-21"
 
-XRAY_CONFIG_DIR="/usr/local/etc/xray"
-XRAY_CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
-SINGBOX_CONFIG_DIR="/root/sing-box-cn-config"
-XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-}"
+set -e
 
-if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'
-    BOLD='\033[1m'
-    NC='\033[0m'
-else
-    RED=''
-    GREEN=''
-    YELLOW=''
-    CYAN=''
-    BOLD=''
-    NC=''
+# ---- 颜色 ----
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+log_info()    { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()    { echo -e "${CYAN}[STEP]${NC} $1"; }
+
+print_line()  { echo -e "${BLUE}=============================================${NC}"; }
+print_dline() { echo -e "${BLUE}=============================================${NC}"; }
+
+# =============================================================
+# 检查 root 权限
+# =============================================================
+if [[ $EUID -ne 0 ]]; then
+    log_error "请使用 root 权限运行此脚本"
+    exit 1
 fi
 
-log_info()  { printf '%b[INFO]%b %s\n' "$GREEN" "$NC" "$*"; }
-log_warn()  { printf '%b[WARN]%b %s\n' "$YELLOW" "$NC" "$*"; }
-log_error() { printf '%b[ERROR]%b %s\n' "$RED" "$NC" "$*" >&2; }
-log_step()  { printf '\n%b[STEP]%b %s\n' "$CYAN" "$NC" "$*"; }
+# =============================================================
+# 系统更新与依赖安装
+# =============================================================
+# 很多 VPS 刚开出来的镜像是几个月前的快照，包索引过期、
+# 软件版本陈旧，容易引发后续安装失败（例如缺少 unzip
+# 导致 Xray 安装报错，或旧版 libssl 导致 WARP 安装失败）。
+# 所以在最开始就做一次完整的系统更新。
+# =============================================================
+log_step "更新系统软件包..."
 
-die() {
-    log_error "$*"
+if command -v apt-get &> /dev/null; then
+    # Debian / Ubuntu 系
+    apt-get update -y
+    log_info "包索引已更新"
+    # upgrade 遇到包冲突时可能非零退出，不应中断脚本
+    apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || \
+        log_warn "系统软件包升级过程中有警告，继续执行..."
+    log_info "系统软件包已升级"
+    apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release
+elif command -v dnf &> /dev/null; then
+    # Fedora / 新版 RHEL 系（dnf 优先于 yum，因为 yum 在 RHEL8+ 仅是 dnf 的别名）
+    dnf update -y
+    dnf install -y unzip curl openssl wget ca-certificates gnupg2
+elif command -v yum &> /dev/null; then
+    # CentOS / RHEL 旧版
+    yum update -y
+    yum install -y unzip curl openssl wget ca-certificates gnupg2
+elif command -v apk &> /dev/null; then
+    # Alpine
+    apk update && apk upgrade
+    apk add --no-cache unzip curl openssl wget ca-certificates gnupg
+else
+    log_warn "未识别的包管理器，请确保系统已更新且已安装: unzip curl openssl wget"
+fi
+
+log_info "系统更新与依赖安装完成"
+echo ""
+
+# =============================================================
+# 欢迎界面
+# =============================================================
+clear
+echo ""
+print_dline
+echo -e "${BOLD}${MAGENTA}     中国大陆网站回国代理一键部署${NC}"
+echo -e "${DIM}     大陆 VPS 原始出口 · sing-box 1.13.14${NC}"
+echo -e "${DIM}     版本 ${SCRIPT_VERSION}  (${SCRIPT_DATE})${NC}"
+print_dline
+echo ""
+log_warn "以下信息将写入服务端配置，请准确填写"
+echo ""
+
+# =============================================================
+# 交互式输入 — 基础参数
+# =============================================================
+
+# ---- UUID ----
+while true; do
+    read -p "$(echo -e ${CYAN}'请输入 UUID（直接回车自动生成）: '${NC})" INPUT_UUID
+    if [[ -z "$INPUT_UUID" ]]; then
+        INPUT_UUID=$(cat /proc/sys/kernel/random/uuid)
+        log_info "已自动生成 UUID: ${INPUT_UUID}"
+        break
+    elif [[ "$INPUT_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        break
+    else
+        log_error "UUID 格式不正确，请重新输入"
+    fi
+done
+
+# ---- 端口 ----
+while true; do
+    read -p "$(echo -e ${CYAN}'请输入监听端口（直接回车使用默认 443）: '${NC})" INPUT_PORT
+    INPUT_PORT=${INPUT_PORT:-443}
+    if [[ "$INPUT_PORT" =~ ^[0-9]+$ ]] && [ "$INPUT_PORT" -ge 1 ] && [ "$INPUT_PORT" -le 65535 ]; then
+        break
+    else
+        log_error "端口号必须在 1-65535 之间"
+    fi
+done
+
+# ---- SNI ----
+read -p "$(echo -e ${CYAN}'请输入 SNI 域名（直接回车使用默认 cdn.jsdelivr.net）: '${NC})" INPUT_SNI
+INPUT_SNI=${INPUT_SNI:-cdn.jsdelivr.net}
+
+# =============================================================
+# 交互 — 是否启用 WARP
+# =============================================================
+ENABLE_WARP=false
+
+# 回国场景必须保留中国大陆 VPS 原始出口，因此跳过母版的 WARP 交互。
+if false; then
+echo ""
+print_line
+echo -e "${BOLD}  Cloudflare WARP 配置${NC}"
+echo -e "${DIM}  WARP 可以让指定流量通过 Cloudflare 干净 IP 出去${NC}"
+echo -e "${DIM}  避免 VPS IP 被 ChatGPT / Claude 等服务封锁${NC}"
+print_line
+echo ""
+echo -e "  ${GREEN}1)${NC} 启用 WARP   ${YELLOW}← 推荐：ChatGPT + Claude 走 WARP${NC}"
+echo -e "  ${GREEN}2)${NC} 不启用      ${DIM}所有流量直接从 VPS IP 出去${NC}"
+echo ""
+
+while true; do
+    read -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认启用）: '${NC})" WARP_CHOICE
+    WARP_CHOICE=${WARP_CHOICE:-1}
+    case "$WARP_CHOICE" in
+        1) ENABLE_WARP=true;  break ;;
+        2) ENABLE_WARP=false; break ;;
+        *) log_error "无效选项，请输入 1-2" ;;
+    esac
+done
+
+# 如果启用 WARP，询问 SOCKS5 端口
+WARP_SOCKS_PORT=40000
+if [ "$ENABLE_WARP" = true ]; then
+    log_info "已选择启用 WARP"
+    while true; do
+        read -p "$(echo -e ${CYAN}'WARP SOCKS5 本地端口（直接回车使用默认 40000）: '${NC})" WARP_PORT_INPUT
+        WARP_SOCKS_PORT=${WARP_PORT_INPUT:-40000}
+        if [[ "$WARP_SOCKS_PORT" =~ ^[0-9]+$ ]] && [ "$WARP_SOCKS_PORT" -ge 1 ] && [ "$WARP_SOCKS_PORT" -le 65535 ]; then
+            break
+        else
+            log_error "端口号必须在 1-65535 之间"
+        fi
+    done
+
+    # 询问需要走 WARP 的服务
+    echo ""
+    echo -e "  ${BOLD}选择需要走 WARP 出口的服务:${NC}"
+    echo ""
+    echo -e "  ${GREEN}1)${NC} ChatGPT + Claude + Apple          ${YELLOW}← 推荐${NC}"
+    echo -e "  ${GREEN}2)${NC} ChatGPT + Claude + Apple + Google"
+    echo -e "  ${GREEN}3)${NC} ChatGPT + Claude + Apple + Google + Netflix"
+    echo -e "  ${GREEN}4)${NC} 全部流量走 WARP                   ${DIM}(所有出站都经过 Cloudflare)${NC}"
+    echo ""
+
+    while true; do
+        read -p "$(echo -e ${CYAN}'请输入选项 [1-4]（直接回车默认 1）: '${NC})" WARP_ROUTE_CHOICE
+        WARP_ROUTE_CHOICE=${WARP_ROUTE_CHOICE:-1}
+        case "$WARP_ROUTE_CHOICE" in
+            1) WARP_ROUTE_MODE="ai";       break ;;
+            2) WARP_ROUTE_MODE="ai+google"; break ;;
+            3) WARP_ROUTE_MODE="ai+google+netflix"; break ;;
+            4) WARP_ROUTE_MODE="all";      break ;;
+            *) log_error "无效选项，请输入 1-4" ;;
+        esac
+    done
+    log_info "WARP 路由模式: ${WARP_ROUTE_MODE}"
+else
+    log_info "已选择不启用 WARP"
+fi
+fi
+
+log_info "回国模式固定不启用 WARP，目标网站将看到大陆 VPS 的原始出口 IP"
+
+# =============================================================
+# 交互 — 客户端系统类型
+# =============================================================
+echo ""
+print_line
+echo -e "${BOLD}  请选择客户端系统类型${NC}"
+echo -e "${DIM}  (不同系统的 sing-box inbounds 配置有本质区别)${NC}"
+print_line
+echo ""
+echo -e "  ${GREEN}1)${NC} iOS          ${YELLOW}← Stash / Shadowrocket / sing-box iOS${NC}"
+echo -e "  ${GREEN}2)${NC} macOS        ${YELLOW}← sing-box macOS (SFI) / V2rayU${NC}"
+echo -e "  ${GREEN}3)${NC} Android      ${YELLOW}← sing-box Android / NekoBox / v2rayNG${NC}"
+echo -e "  ${GREEN}4)${NC} Windows      ${YELLOW}← sing-box Windows / v2rayN / NekoRay${NC}"
+echo -e "  ${GREEN}5)${NC} Linux        ${YELLOW}← sing-box CLI / 旁路由网关${NC}"
+echo ""
+
+while true; do
+    read -p "$(echo -e ${CYAN}'请输入选项 [1-5]（直接回车默认 iOS）: '${NC})" OS_CHOICE
+    OS_CHOICE=${OS_CHOICE:-1}
+    case "$OS_CHOICE" in
+        1) CLIENT_OS="ios";     break ;;
+        2) CLIENT_OS="macos";   break ;;
+        3) CLIENT_OS="android"; break ;;
+        4) CLIENT_OS="windows"; break ;;
+        5) CLIENT_OS="linux";   break ;;
+        *) log_error "无效选项，请输入 1-5" ;;
+    esac
+done
+log_info "已选择客户端系统: ${CLIENT_OS}"
+
+# =============================================================
+# 交互 — TLS 指纹
+# =============================================================
+case "$CLIENT_OS" in
+    ios)     DEFAULT_FP="safari";  DEFAULT_FP_NUM=3 ;;
+    macos)   DEFAULT_FP="chrome";  DEFAULT_FP_NUM=1 ;;
+    android) DEFAULT_FP="chrome";  DEFAULT_FP_NUM=1 ;;
+    windows) DEFAULT_FP="chrome";  DEFAULT_FP_NUM=1 ;;
+    linux)   DEFAULT_FP="firefox"; DEFAULT_FP_NUM=2 ;;
+esac
+
+echo ""
+print_line
+echo -e "${BOLD}  请选择 TLS 客户端指纹 (uTLS Fingerprint)${NC}"
+echo -e "${DIM}  (已根据客户端系统推荐默认值)${NC}"
+print_line
+echo ""
+echo -e "  ${GREEN}1)${NC} chrome       $([ "$DEFAULT_FP" = "chrome"  ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
+echo -e "  ${GREEN}2)${NC} firefox      $([ "$DEFAULT_FP" = "firefox" ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
+echo -e "  ${GREEN}3)${NC} safari       $([ "$DEFAULT_FP" = "safari"  ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
+echo -e "  ${GREEN}4)${NC} edge"
+echo -e "  ${GREEN}5)${NC} random       ${DIM}(随机指纹)${NC}"
+echo ""
+
+while true; do
+    read -p "$(echo -e ${CYAN}"请输入选项 [1-5]（直接回车默认 ${DEFAULT_FP}）: "${NC})" FP_CHOICE
+    FP_CHOICE=${FP_CHOICE:-$DEFAULT_FP_NUM}
+    case "$FP_CHOICE" in
+        1) CLIENT_FINGERPRINT="chrome";  break ;;
+        2) CLIENT_FINGERPRINT="firefox"; break ;;
+        3) CLIENT_FINGERPRINT="safari";  break ;;
+        4) CLIENT_FINGERPRINT="edge";    break ;;
+        5) CLIENT_FINGERPRINT="random";  break ;;
+        *) log_error "无效选项，请输入 1-5" ;;
+    esac
+done
+log_info "已选择 TLS 指纹: ${CLIENT_FINGERPRINT}"
+
+# =============================================================
+# 交互 — 路由模式
+# =============================================================
+ROUTE_MODE="cn"
+
+# 回国脚本只生成“中国大陆走代理、其他流量直连”这一种分流模式。
+if false; then
+echo ""
+print_line
+echo -e "${BOLD}  请选择 sing-box 客户端路由模式${NC}"
+print_line
+echo ""
+echo -e "  ${GREEN}1)${NC} 全局代理     ${YELLOW}← 所有流量走代理${NC}"
+echo -e "  ${GREEN}2)${NC} 分流模式     ${YELLOW}← 国内直连 + 国外代理 (推荐)${NC}"
+echo ""
+
+while true; do
+    read -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认分流模式）: '${NC})" ROUTE_CHOICE
+    ROUTE_CHOICE=${ROUTE_CHOICE:-2}
+    case "$ROUTE_CHOICE" in
+        1) ROUTE_MODE="global"; break ;;
+        2) ROUTE_MODE="split";  break ;;
+        *) log_error "无效选项，请输入 1-2" ;;
+    esac
+done
+log_info "已选择路由模式: ${ROUTE_MODE}"
+fi
+
+log_info "已固定回国分流模式：中国大陆走代理，其他流量本地直连"
+
+echo ""
+echo ""
+print_line
+echo -e "${BOLD}  配置汇总确认${NC}"
+print_line
+echo ""
+echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
+echo -e "  端口        : ${GREEN}${INPUT_PORT}${NC}"
+echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
+echo -e "  WARP        : ${GREEN}不安装、不使用${NC}"
+echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
+echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
+echo -e "  路由模式    : ${GREEN}中国大陆代理 / 其他直连${NC}"
+echo ""
+read -p "$(echo -e ${CYAN}'确认以上配置开始部署？[Y/n]: '${NC})" CONFIRM
+CONFIRM=${CONFIRM:-Y}
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    log_warn "已取消部署"
+    exit 0
+fi
+
+echo ""
+log_info "开始部署..."
+echo ""
+
+# =============================================================
+# 安装 Xray
+# =============================================================
+log_step "安装 Xray..."
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+log_info "Xray 安装完成"
+
+# ---- 生成密钥对 ----
+# xray x25519 输出格式 (现代版本):
+#   Private key: xxxx
+#   Public key:  xxxx
+# 使用 sed 提取冒号后的内容并去除首尾空白，兼容不同版本的输出格式
+KEYPAIR=$(xray x25519)
+PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private" | sed 's/.*:[[:space:]]*//')
+PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "public" | sed 's/.*:[[:space:]]*//')
+
+# 验证密钥不为空
+if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+    log_error "密钥对生成失败，请检查 xray x25519 输出:"
+    echo "$KEYPAIR"
     exit 1
-}
+fi
 
-on_error() {
-    local exit_code=$?
-    local line_no=${1:-unknown}
-    log_error "脚本在第 ${line_no} 行失败（退出码 ${exit_code}）"
-    exit "$exit_code"
-}
+# ---- 生成 Short ID ----
+SHORT_ID=$(openssl rand -hex 8)
 
-trap 'on_error "$LINENO"' ERR
+# ---- 获取服务器 IP ----
+# 强制 IPv4：服务端监听 0.0.0.0（仅 IPv4），且 IPv6 地址写入
+# VLESS 链接时需要加方括号，统一取 IPv4 避免生成不可用的配置
+SERVER_IP=$(curl -4s --max-time 5 ifconfig.me 2>/dev/null \
+         || curl -4s --max-time 5 ip.sb 2>/dev/null \
+         || curl -4s --max-time 5 ipinfo.io/ip 2>/dev/null \
+         || echo "YOUR_SERVER_IP")
 
-require_root() {
-    [[ ${EUID} -eq 0 ]] || die "请使用 root 权限运行此脚本"
-}
+echo ""
+print_dline
+echo -e "${BOLD}${MAGENTA}  密钥信息（请妥善保存）${NC}"
+print_dline
+echo ""
+echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
+echo -e "  Private Key : ${GREEN}${PRIVATE_KEY}${NC}"
+echo -e "  Public Key  : ${GREEN}${PUBLIC_KEY}${NC}"
+echo -e "  Short ID    : ${GREEN}${SHORT_ID}${NC}"
+echo -e "  服务器 IP   : ${GREEN}${SERVER_IP}${NC}"
+echo ""
+print_dline
+echo ""
 
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
+# =============================================================
+# 安装并配置 Cloudflare WARP (如果启用)
+# =============================================================
+if [ "$ENABLE_WARP" = true ]; then
+    log_step "安装 Cloudflare WARP..."
 
-valid_port() {
-    [[ $1 =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 ))
-}
-
-valid_uuid() {
-    [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
-}
-
-valid_hostname_or_ipv4() {
-    local value=$1
-    [[ $value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
-    [[ $value != *..* ]]
-}
-
-valid_fingerprint() {
-    [[ $1 =~ ^(chrome|firefox|safari|edge)$ ]]
-}
-
-valid_client_os() {
-    [[ $1 =~ ^(ios|macos|android|windows|linux)$ ]]
-}
-
-install_dependencies() {
-    log_step "安装基础依赖"
-
-    if command_exists apt-get; then
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ca-certificates curl unzip openssl python3 iproute2
-    elif command_exists dnf; then
-        dnf install -y ca-certificates curl unzip openssl python3 iproute
-    elif command_exists yum; then
-        yum install -y ca-certificates curl unzip openssl python3 iproute
-    else
-        die "不支持当前包管理器；本脚本支持使用 systemd 的 Debian、Ubuntu、Fedora、RHEL、Rocky Linux 和 AlmaLinux"
-    fi
-}
-
-generate_uuid() {
-    if [[ -r /proc/sys/kernel/random/uuid ]]; then
-        tr 'A-F' 'a-f' </proc/sys/kernel/random/uuid
-    elif command_exists uuidgen; then
-        uuidgen | tr 'A-F' 'a-f'
-    else
-        die "无法自动生成 UUID，请通过 CN_UUID 环境变量提供"
-    fi
-}
-
-detect_public_ipv4() {
-    local url candidate
-    local urls=(
-        "https://api.ipify.org"
-        "https://ipv4.icanhazip.com"
-        "https://ifconfig.me/ip"
-        "https://api-ipv4.ip.sb/ip"
-    )
-
-    for url in "${urls[@]}"; do
-        candidate=$(curl -4fsS --connect-timeout 4 --max-time 8 "$url" 2>/dev/null || true)
-        candidate=${candidate//$'\r'/}
-        candidate=${candidate//$'\n'/}
-        if [[ $candidate =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-prompt_with_default() {
-    local prompt=$1
-    local default_value=$2
-    local result
-    read -r -p "${prompt} [${default_value}]: " result
-    printf '%s\n' "${result:-$default_value}"
-}
-
-collect_configuration() {
-    printf '\n%b中国大陆网站回国代理部署脚本%b\n' "$BOLD" "$NC"
-    printf '版本 %s（%s）\n\n' "$SCRIPT_VERSION" "$SCRIPT_DATE"
-
-    INPUT_UUID=${CN_UUID:-}
-    if [[ -z $INPUT_UUID ]]; then
-        INPUT_UUID=$(generate_uuid)
-        INPUT_UUID=$(prompt_with_default "UUID" "$INPUT_UUID")
-    fi
-    valid_uuid "$INPUT_UUID" || die "UUID 格式不正确"
-    INPUT_UUID=$(printf '%s' "$INPUT_UUID" | tr 'A-F' 'a-f')
-
-    INPUT_PORT=${CN_PORT:-}
-    if [[ -z $INPUT_PORT ]]; then
-        INPUT_PORT=$(prompt_with_default "Xray 监听端口" "443")
-    fi
-    valid_port "$INPUT_PORT" || die "端口必须在 1-65535 之间"
-
-    INPUT_SNI=${CN_REALITY_SERVER_NAME:-}
-    if [[ -z $INPUT_SNI ]]; then
-        INPUT_SNI=$(prompt_with_default "REALITY 目标域名/SNI" "www.microsoft.com")
-    fi
-    valid_hostname_or_ipv4 "$INPUT_SNI" || die "REALITY 目标域名格式不正确"
-
-    SERVER_ADDRESS=${CN_SERVER_ADDRESS:-}
-    if [[ -z $SERVER_ADDRESS ]]; then
-        local detected_ip=""
-        detected_ip=$(detect_public_ipv4 || true)
-        if [[ -n $detected_ip ]]; then
-            SERVER_ADDRESS=$(prompt_with_default "客户端连接的服务器公网 IP 或域名" "$detected_ip")
-        else
-            read -r -p "客户端连接的服务器公网 IP 或域名: " SERVER_ADDRESS
+    # 检测系统类型
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        # VERSION_CODENAME 在部分最小化镜像中可能为空，回退到 lsb_release
+        OS_VERSION="${VERSION_CODENAME:-}"
+        if [ -z "$OS_VERSION" ] && command -v lsb_release &> /dev/null; then
+            OS_VERSION=$(lsb_release -cs 2>/dev/null || true)
         fi
     fi
-    valid_hostname_or_ipv4 "$SERVER_ADDRESS" || die "服务器地址格式不正确"
 
-    CLIENT_OS=${CN_CLIENT_OS:-}
-    if [[ -z $CLIENT_OS ]]; then
-        printf '\n客户端系统：1) iOS  2) macOS  3) Android  4) Windows  5) Linux\n'
-        local os_choice
-        read -r -p "请选择 [1-5，默认 2]: " os_choice
-        case "${os_choice:-2}" in
-            1) CLIENT_OS="ios" ;;
-            2) CLIENT_OS="macos" ;;
-            3) CLIENT_OS="android" ;;
-            4) CLIENT_OS="windows" ;;
-            5) CLIENT_OS="linux" ;;
-            *) die "客户端系统选项无效" ;;
+    # 安装 WARP 客户端
+    # 如果已安装则跳过下载步骤
+    if ! command -v warp-cli &> /dev/null; then
+        log_info "正在添加 Cloudflare WARP 仓库..."
+
+        case "$OS_ID" in
+            ubuntu|debian)
+                if [ -z "$OS_VERSION" ]; then
+                    log_error "无法获取系统版本代号（VERSION_CODENAME 为空），请手动安装 cloudflare-warp"
+                    log_warn "跳过 WARP 安装，其他配置将继续..."
+                    ENABLE_WARP=false
+                else
+                    # 添加 Cloudflare GPG key 和仓库
+                    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+                        | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+                    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${OS_VERSION} main" \
+                        > /etc/apt/sources.list.d/cloudflare-client.list
+
+                    apt-get update
+                    apt-get install -y cloudflare-warp
+                fi
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                # 使用包管理器安装 repo 包，自动处理依赖关系
+                RHEL_VER=$(rpm -E %rhel 2>/dev/null || echo "8")
+                if command -v dnf &> /dev/null; then
+                    dnf install -y "https://pkg.cloudflareclient.com/cloudflare-release-el${RHEL_VER}.rpm" 2>/dev/null \
+                        || dnf install -y "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
+                    dnf install -y cloudflare-warp
+                else
+                    yum install -y "https://pkg.cloudflareclient.com/cloudflare-release-el${RHEL_VER}.rpm" 2>/dev/null \
+                        || yum install -y "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
+                    yum install -y cloudflare-warp
+                fi
+                ;;
+            *)
+                log_error "不支持的系统: ${OS_ID}，请手动安装 cloudflare-warp"
+                log_warn "跳过 WARP 安装，其他配置将继续..."
+                ENABLE_WARP=false
+                ;;
         esac
-    fi
-    valid_client_os "$CLIENT_OS" || die "CN_CLIENT_OS 必须是 ios、macos、android、windows 或 linux"
-
-    CLIENT_FINGERPRINT=${CN_FINGERPRINT:-}
-    if [[ -z $CLIENT_FINGERPRINT ]]; then
-        case "$CLIENT_OS" in
-            ios) CLIENT_FINGERPRINT="safari" ;;
-            linux) CLIENT_FINGERPRINT="firefox" ;;
-            *) CLIENT_FINGERPRINT="chrome" ;;
-        esac
-        CLIENT_FINGERPRINT=$(prompt_with_default "uTLS 指纹（chrome/firefox/safari/edge）" "$CLIENT_FINGERPRINT")
-    fi
-    valid_fingerprint "$CLIENT_FINGERPRINT" || die "不支持的 uTLS 指纹"
-
-    printf '\n%b配置摘要%b\n' "$BOLD" "$NC"
-    printf '  服务器地址 : %s\n' "$SERVER_ADDRESS"
-    printf '  监听端口   : %s\n' "$INPUT_PORT"
-    printf '  UUID       : %s\n' "$INPUT_UUID"
-    printf '  REALITY SNI: %s\n' "$INPUT_SNI"
-    printf '  客户端系统 : %s\n' "$CLIENT_OS"
-    printf '  uTLS 指纹  : %s\n' "$CLIENT_FINGERPRINT"
-    printf '  WARP       : 禁用（固定使用大陆 VPS 原始出口）\n\n'
-
-    if [[ ${CN_ASSUME_YES:-0} != 1 ]]; then
-        local confirm
-        read -r -p "确认部署？[Y/n]: " confirm
-        [[ ${confirm:-Y} =~ ^[Yy]$ ]] || die "部署已取消"
-    fi
-}
-
-verify_xray_installer() {
-    local installer=$1
-    [[ -s $installer ]] || return 1
-    bash -n "$installer" >/dev/null 2>&1 || return 1
-    grep -q 'XTLS/Xray-install' "$installer"
-}
-
-download_xray_installer() {
-    local destination=$1
-    local source_file=${CN_XRAY_INSTALLER_FILE:-}
-    local proxy=${CN_XRAY_PROXY:-}
-    local url
-    local urls=()
-    # 与 install.sh 使用相同的 curl 网络行为：不设置连接或总下载时限。
-    # 大陆网络连接 GitHub 可能很慢，过短的超时会误判为下载失败。
-    local curl_args=(-fsSL)
-
-    if [[ -n $source_file ]]; then
-        [[ -f $source_file ]] || {
-            log_error "CN_XRAY_INSTALLER_FILE 不存在：${source_file}"
-            return 1
-        }
-        cp "$source_file" "$destination"
-        verify_xray_installer "$destination" || {
-            log_error "本地 Xray 安装器无效或 Bash 语法不正确：${source_file}"
-            return 1
-        }
-        log_info "使用本地 Xray 官方安装器：${source_file}"
-        return 0
+    else
+        log_info "warp-cli 已安装，跳过安装步骤"
     fi
 
-    [[ -n $XRAY_INSTALL_URL ]] && urls+=("$XRAY_INSTALL_URL")
-    urls+=(
-        "https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-        "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-    )
-    [[ -n $proxy ]] && curl_args+=(--proxy "$proxy")
+    # 配置 WARP（仅在安装成功时执行）
+    if [ "$ENABLE_WARP" = true ] && command -v warp-cli &> /dev/null; then
+        log_info "配置 WARP 客户端..."
 
-    for url in "${urls[@]}"; do
-        log_info "尝试下载 Xray 官方安装器：${url}"
-        if curl "${curl_args[@]}" "$url" -o "$destination"; then
-            if verify_xray_installer "$destination"; then
-                log_info "Xray 官方安装器下载成功"
-                return 0
+        # 等待 warp-svc 守护进程完全就绪
+        # 刚安装完 cloudflare-warp 后，warp-svc 需要几秒钟来初始化
+        # 如果在这之前就调用 warp-cli，会出现 "Registration Missing
+        # due to: Daemon Startup" 之类的错误
+        log_info "等待 WARP 守护进程就绪..."
+        for i in $(seq 1 15); do
+            if warp-cli --accept-tos status 2>/dev/null | grep -qi "Disconnected\|Connected"; then
+                log_info "WARP 守护进程已就绪"
+                break
             fi
-            log_warn "下载内容不是有效的 Xray 官方安装器，尝试下一个地址"
+            if [ "$i" -eq 15 ]; then
+                log_warn "等待超时，继续尝试..."
+            fi
+            sleep 2
+        done
+
+        # 注册 WARP
+        # 判断是否已经注册：精确匹配 "Registration Missing" 或 "Unable to"，
+        # 避免 "Missing" 单独匹配到其他无关状态消息
+        WARP_STATUS_CHECK=$(warp-cli --accept-tos status 2>&1 || true)
+        if echo "$WARP_STATUS_CHECK" | grep -qi "Registration Missing\|Unable to"; then
+            log_info "注册 WARP..."
+            warp-cli --accept-tos registration new
+            sleep 3
+            log_info "WARP 注册完成"
+        elif echo "$WARP_STATUS_CHECK" | grep -qi "Disconnected\|Connected"; then
+            log_info "WARP 已注册，跳过注册步骤"
         else
-            log_warn "下载失败，尝试下一个官方地址"
+            # 无法判断状态，尝试注册一次（重复注册不会出错）
+            log_info "WARP 状态不确定，尝试注册..."
+            warp-cli --accept-tos registration new 2>/dev/null || true
+            sleep 3
         fi
-        : >"$destination"
+
+        # 设置为 proxy 模式（仅开 SOCKS5 端口，不接管系统全部流量）
+        #
+        # 这一步很关键：WARP 有两种运行模式
+        #   - warp 模式：接管整个系统的网络流量（会影响 SSH 连接！）
+        #   - proxy 模式：仅在本地开一个 SOCKS5 代理端口，不影响系统网络
+        #
+        # 我们选择 proxy 模式，让 Xray 通过 SOCKS5 端口选择性地转发流量
+        log_info "设置 WARP 为 proxy 模式 (SOCKS5 端口: ${WARP_SOCKS_PORT})..."
+        warp-cli --accept-tos mode proxy
+        warp-cli --accept-tos proxy port ${WARP_SOCKS_PORT}
+
+        # 连接 WARP（连接失败不应立即中断脚本，下方重试循环会检测连接状态）
+        log_info "连接 WARP..."
+        warp-cli --accept-tos connect || true
+
+        # 等待连接建立（使用重试循环，最多等 30 秒）
+        # WARP 连接需要与 Cloudflare 边缘服务器建立 WireGuard 隧道，
+        # 根据网络条件可能需要 5-15 秒不等
+        WARP_CONNECTED=false
+        log_info "等待 WARP 连接建立..."
+        for i in $(seq 1 15); do
+            WARP_STATUS=$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")
+            if echo "$WARP_STATUS" | grep -qi "Connected" && ! echo "$WARP_STATUS" | grep -qi "Disconnected"; then
+                WARP_CONNECTED=true
+                log_info "WARP 连接成功 (等待了约 $((i*2)) 秒)"
+                break
+            fi
+            sleep 2
+        done
+
+        if [ "$WARP_CONNECTED" = true ]; then
+            # 验证 SOCKS5 端口是否在监听
+            if ss -tlnp | grep -q ":${WARP_SOCKS_PORT}"; then
+                log_info "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 监听正常"
+            else
+                log_warn "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 未检测到监听"
+                log_warn "请稍后手动检查: ss -tlnp | grep ${WARP_SOCKS_PORT}"
+            fi
+
+            # 测试 WARP 出口 IP（通过 WARP SOCKS5 代理访问）
+            WARP_IP=$(curl -s --max-time 10 --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me 2>/dev/null || echo "获取失败")
+            log_info "WARP 出口 IP: ${WARP_IP}"
+            if [ "$WARP_IP" != "$SERVER_IP" ] && [ "$WARP_IP" != "获取失败" ]; then
+                log_info "WARP 出口 IP 与 VPS IP 不同，WARP 工作正常"
+            else
+                log_warn "WARP 出口 IP 获取异常，请稍后手动验证:"
+                log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
+            fi
+        else
+            log_warn "WARP 连接超时 (等待了 30 秒)"
+            log_warn "最后状态: ${WARP_STATUS}"
+            log_warn ""
+            log_warn "这通常是因为 WARP 守护进程刚启动需要更多时间"
+            log_warn "请稍后手动执行以下命令来完成连接:"
+            log_warn "  warp-cli disconnect"
+            log_warn "  warp-cli registration new"
+            log_warn "  warp-cli mode proxy"
+            log_warn "  warp-cli proxy port ${WARP_SOCKS_PORT}"
+            log_warn "  warp-cli connect"
+            log_warn "  warp-cli status"
+            log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
+        fi
+
+        # 设置 WARP 开机自启
+        systemctl enable warp-svc 2>/dev/null || true
+
+    fi
+fi
+
+# =============================================================
+# 构建 WARP 相关的域名列表（用于 Xray 服务端路由规则）
+# =============================================================
+#
+# 这些域名列表决定了哪些流量会被转发到 WARP SOCKS5 出口。
+# 每个服务的域名来自实际抓包和官方文档，覆盖了 API、CDN、
+# 认证、WebSocket 等所有必要的子域名。
+#
+
+# ChatGPT / OpenAI 相关域名
+OPENAI_DOMAINS=(
+    "openai.com"
+    "chat.openai.com"
+    "auth0.openai.com"
+    "platform.openai.com"
+    "api.openai.com"
+    "chatgpt.com"
+    "auth.openai.com"
+    "operator.chatgpt.com"
+    "ab.chatgpt.com"
+    "cdn.oaistatic.com"
+    "oaistatic.com"
+    "oaiusercontent.com"
+    "files.oaiusercontent.com"
+    "sentry.io"
+    "intercomcdn.com"
+    "intercom.io"
+    "featuregates.org"
+    "statsigapi.net"
+    "identrust.com"
+)
+
+# Claude / Anthropic 相关域名
+CLAUDE_DOMAINS=(
+    "anthropic.com"
+    "claude.ai"
+    "api.anthropic.com"
+    "console.anthropic.com"
+    "docs.anthropic.com"
+    "support.anthropic.com"
+    "cdn.anthropic.com"
+    "statsig.anthropic.com"
+    "servd-anthropic.b-cdn.net"
+)
+
+# Google 相关域名（可选）
+GOOGLE_DOMAINS=(
+    "google.com"
+    "googleapis.com"
+    "google.com.hk"
+    "googleusercontent.com"
+    "gstatic.com"
+    "ggpht.com"
+    "googlevideo.com"
+    "youtube.com"
+    "ytimg.com"
+    "gmail.com"
+    "google.co.jp"
+)
+
+# Netflix 相关域名（可选）
+NETFLIX_DOMAINS=(
+    "netflix.com"
+    "netflix.net"
+    "nflxvideo.net"
+    "nflximg.net"
+    "nflximg.com"
+    "nflxext.com"
+    "nflxso.net"
+)
+
+# Apple 相关域名（账号注册 / iCloud / App Store）
+APPLE_DOMAINS=(
+    "apple.com"
+    "icloud.com"
+    "mzstatic.com"
+    "cdn-apple.com"
+    "apple-cloudkit.com"
+    "icloud-content.com"
+)
+
+# =============================================================
+# 根据用户选择组装 WARP 域名路由规则
+# =============================================================
+build_warp_domain_rules() {
+    # 此函数生成 Xray 路由规则中的 domain 数组内容
+    local ALL_WARP_DOMAINS=()
+
+    if [ "$ENABLE_WARP" = true ]; then
+        # ChatGPT + Claude + Apple 始终包含（模式 1/2/3 均含 Apple）
+        ALL_WARP_DOMAINS+=("${OPENAI_DOMAINS[@]}")
+        ALL_WARP_DOMAINS+=("${CLAUDE_DOMAINS[@]}")
+        ALL_WARP_DOMAINS+=("${APPLE_DOMAINS[@]}")
+
+        # 根据选择追加 Google
+        if [[ "$WARP_ROUTE_MODE" == "ai+google" || "$WARP_ROUTE_MODE" == "ai+google+netflix" ]]; then
+            ALL_WARP_DOMAINS+=("${GOOGLE_DOMAINS[@]}")
+        fi
+
+        # 根据选择追加 Netflix
+        if [[ "$WARP_ROUTE_MODE" == "ai+google+netflix" ]]; then
+            ALL_WARP_DOMAINS+=("${NETFLIX_DOMAINS[@]}")
+        fi
+    fi
+
+    # 输出为 JSON 数组格式
+    local FIRST=true
+    for domain in "${ALL_WARP_DOMAINS[@]}"; do
+        if [ "$FIRST" = true ]; then
+            echo -n "\"domain:${domain}\""
+            FIRST=false
+        else
+            echo -n ", \"domain:${domain}\""
+        fi
     done
-
-    return 1
 }
 
-verify_local_xray_archive() {
-    local archive=$1
-    local digest_file=${CN_XRAY_LOCAL_DGST:-${archive}.dgst}
-    local expected_sha=${CN_XRAY_LOCAL_SHA256:-}
-    local actual_sha expected_sha_normalized
+# =============================================================
+# 写入 Xray 服务端配置
+# =============================================================
+log_step "写入 Xray 服务端配置文件..."
 
-    [[ -f $archive ]] || die "CN_XRAY_LOCAL_ZIP 不存在：${archive}"
-    unzip -tq "$archive" >/dev/null || die "本地 Xray ZIP 已损坏：${archive}"
-
-    if [[ -f $digest_file ]]; then
-        expected_sha=$(awk -F '= ' '/256=/ {print $2; exit}' "$digest_file")
-        [[ -n $expected_sha ]] || die "无法从校验文件读取 SHA-256：${digest_file}"
-    fi
-
-    [[ $expected_sha =~ ^[0-9a-fA-F]{64}$ ]] || die \
-        "离线安装必须提供官方校验文件 ${archive}.dgst，或设置 CN_XRAY_LOCAL_SHA256"
-
-    command_exists sha256sum || die "找不到 sha256sum，无法校验本地 Xray ZIP"
-    actual_sha=$(sha256sum "$archive" | awk '{print $1}' | tr 'A-F' 'a-f')
-    expected_sha_normalized=$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')
-    [[ $actual_sha == "$expected_sha_normalized" ]] || die "本地 Xray ZIP 的 SHA-256 校验失败"
-    log_info "本地 Xray ZIP 的 SHA-256 校验通过"
-}
-
-install_xray() {
-    log_step "安装或更新 Xray"
-
-    if command_exists xray && [[ -f /etc/systemd/system/xray.service ]] && \
-       [[ ${CN_FORCE_XRAY_UPDATE:-0} != 1 ]] && [[ -z ${CN_XRAY_LOCAL_ZIP:-} ]]; then
-        local installed_version
-        installed_version=$(xray version)
-        log_info "已安装 ${installed_version%%$'\n'*}，跳过联网更新"
-        log_info "如需强制更新，请设置 CN_FORCE_XRAY_UPDATE=1"
-        return 0
-    fi
-
-    local installer
-    local local_archive=${CN_XRAY_LOCAL_ZIP:-}
-    local proxy=${CN_XRAY_PROXY:-}
-    local install_status=0
-    installer=$(mktemp /tmp/install-cn-xray.XXXXXX.sh)
-
-    if ! download_xray_installer "$installer"; then
-        rm -f "$installer"
-        log_error "无法从 Xray 官方 GitHub 地址下载安装器（curl 退出码 28 表示超时）"
-        log_error "可以在美国电脑下载官方安装器和 Xray ZIP，再 scp 到服务器进行离线安装。"
-        log_error "重新运行时设置：CN_XRAY_INSTALLER_FILE、CN_XRAY_LOCAL_ZIP，并提供同名 .dgst 文件。"
-        return 1
-    fi
-
-    if [[ -n $local_archive ]]; then
-        verify_local_xray_archive "$local_archive"
-        bash "$installer" install --local "$local_archive" || install_status=$?
-    elif [[ -n $proxy ]]; then
-        bash "$installer" install --proxy "$proxy" || install_status=$?
-    else
-        bash "$installer" install || install_status=$?
-    fi
-    rm -f "$installer"
-
-    if (( install_status != 0 )); then
-        log_error "Xray 官方安装器执行失败（退出码 ${install_status}）"
-        if [[ -z $proxy && -z $local_archive ]]; then
-            log_error "安装器仍需访问 api.github.com 和 GitHub Releases。"
-            log_error "请设置 CN_XRAY_PROXY，或使用 CN_XRAY_LOCAL_ZIP 离线安装。"
-        fi
-        return "$install_status"
-    fi
-
-    command_exists xray || die "Xray 安装完成后仍找不到 xray 命令"
-    local xray_version
-    xray_version=$(xray version)
-    log_info "${xray_version%%$'\n'*}"
-}
-
-generate_reality_keys() {
-    log_step "生成 REALITY 密钥"
-    local keypair
-    keypair=$(xray x25519)
-
-    PRIVATE_KEY=$(awk -F':[[:space:]]*' '
-        tolower($1) ~ /private/ { print $2; exit }
-    ' <<<"$keypair")
-
-    PUBLIC_KEY=$(awk -F':[[:space:]]*' '
-        tolower($1) ~ /public|password/ { print $2; exit }
-    ' <<<"$keypair")
-
-    [[ -n $PRIVATE_KEY && -n $PUBLIC_KEY ]] || {
-        log_error "无法解析 xray x25519 输出："
-        printf '%s\n' "$keypair" >&2
-        return 1
-    }
-
-    SHORT_ID=$(openssl rand -hex 8)
-    log_info "REALITY 密钥和 Short ID 已生成"
-}
-
-check_reality_target() {
-    log_step "检查 REALITY 目标"
-    if xray tls ping "$INPUT_SNI" >/tmp/install-cn-reality-check.log 2>&1; then
-        log_info "REALITY 目标 ${INPUT_SNI}:443 可连接"
-    else
-        log_warn "xray tls ping 未能确认 ${INPUT_SNI}:443 可用"
-        log_warn "检查结果保存在 /tmp/install-cn-reality-check.log"
-        log_warn "如果客户端发生 REALITY 握手失败，请更换 CN_REALITY_SERVER_NAME 后重新运行脚本"
-    fi
-}
-
-write_xray_config() {
-    log_step "写入 Xray 服务端配置"
-    mkdir -p "$XRAY_CONFIG_DIR"
-
-    if [[ -f $XRAY_CONFIG_FILE ]]; then
-        local backup_file
-        backup_file="${XRAY_CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-        cp -p "$XRAY_CONFIG_FILE" "$backup_file"
-        log_info "旧配置已备份到 ${backup_file}"
-    fi
-
-    local temp_config
-    temp_config=$(mktemp /tmp/install-cn-xray-config.XXXXXX.json)
-    cat >"$temp_config" <<EOF
+# 根据是否启用 WARP 以及路由模式，生成不同的服务端配置
+if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
+    # ---- 全部流量走 WARP：default outbound 改为 warp ----
+    cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": {
     "loglevel": "warning"
   },
   "inbounds": [
     {
-      "tag": "vless-reality-in",
       "listen": "0.0.0.0",
       "port": ${INPUT_PORT},
       "protocol": "vless",
@@ -426,7 +695,7 @@ write_xray_config() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "target": "${INPUT_SNI}:443",
+          "dest": "${INPUT_SNI}:443",
           "xver": 0,
           "serverNames": ["${INPUT_SNI}"],
           "privateKey": "${PRIVATE_KEY}",
@@ -441,12 +710,24 @@ write_xray_config() {
   ],
   "outbounds": [
     {
-      "tag": "direct",
-      "protocol": "freedom"
+      "protocol": "socks",
+      "tag": "warp",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": ${WARP_SOCKS_PORT}
+          }
+        ]
+      }
     },
     {
-      "tag": "block",
-      "protocol": "blackhole"
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
     }
   ],
   "routing": {
@@ -462,59 +743,232 @@ write_xray_config() {
 }
 EOF
 
-    xray run -test -config "$temp_config"
-    install -m 0644 "$temp_config" "$XRAY_CONFIG_FILE"
-    rm -f "$temp_config"
-    log_info "Xray 配置验证通过：${XRAY_CONFIG_FILE}"
+elif [ "$ENABLE_WARP" = true ]; then
+    # ---- 指定域名走 WARP，其他流量直连 ----
+    # 先构建域名列表
+    WARP_DOMAIN_JSON=$(build_warp_domain_rules)
+
+    cat > /usr/local/etc/xray/config.json << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${INPUT_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${INPUT_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${INPUT_SNI}:443",
+          "xver": 0,
+          "serverNames": ["${INPUT_SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "socks",
+      "tag": "warp",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": ${WARP_SOCKS_PORT}
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "domain": [${WARP_DOMAIN_JSON}],
+        "outboundTag": "warp"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      }
+    ]
+  }
 }
+EOF
 
-configure_firewall() {
-    log_step "检查服务器防火墙"
-
-    if command_exists ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw allow "${INPUT_PORT}/tcp"
-        log_info "ufw 已放行 TCP ${INPUT_PORT}"
-    elif command_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${INPUT_PORT}/tcp"
-        firewall-cmd --reload
-        log_info "firewalld 已放行 TCP ${INPUT_PORT}"
-    else
-        log_warn "未发现正在运行的 ufw/firewalld；未修改系统防火墙"
-    fi
-
-    log_warn "请同时在云厂商安全组中放行 TCP ${INPUT_PORT}"
+else
+    # ---- 不启用 WARP，纯 freedom 出站 ----
+    cat > /usr/local/etc/xray/config.json << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${INPUT_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${INPUT_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${INPUT_SNI}:443",
+          "xver": 0,
+          "serverNames": ["${INPUT_SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      }
+    ]
+  }
 }
+EOF
+fi
 
-start_xray() {
-    log_step "启动 Xray"
-    systemctl enable xray >/dev/null
-    systemctl restart xray
+log_info "服务端配置已写入 /usr/local/etc/xray/config.json"
 
-    if ! systemctl is-active --quiet xray; then
-        journalctl -u xray -n 80 --no-pager || true
-        die "Xray 启动失败"
-    fi
+# =============================================================
+# 验证配置
+# =============================================================
+log_step "验证配置文件..."
+if xray run -test -config /usr/local/etc/xray/config.json; then
+    log_info "配置文件验证通过"
+else
+    log_error "配置文件验证失败，请检查"
+    exit 1
+fi
 
-    if ss -ltnp | grep -q ":${INPUT_PORT}[[:space:]]"; then
-        log_info "Xray 已监听 TCP ${INPUT_PORT}"
-    else
-        log_warn "未在 ss 输出中确认端口 ${INPUT_PORT}，请运行：ss -ltnp"
-    fi
-}
+# =============================================================
+# 防火墙放行端口
+# =============================================================
+log_step "配置防火墙..."
+if command -v ufw &> /dev/null; then
+    ufw allow ${INPUT_PORT}/tcp
+    log_info "ufw 已放行端口 ${INPUT_PORT}"
+elif command -v firewall-cmd &> /dev/null; then
+    firewall-cmd --permanent --add-port=${INPUT_PORT}/tcp
+    firewall-cmd --reload
+    log_info "firewalld 已放行端口 ${INPUT_PORT}"
+else
+    log_warn "未检测到防火墙工具，请手动放行端口 ${INPUT_PORT}"
+fi
 
-default_fingerprint_for_os() {
+# =============================================================
+# 启动 Xray
+# =============================================================
+log_step "启动 Xray 服务..."
+systemctl enable xray
+systemctl restart xray
+
+sleep 2
+
+if systemctl is-active --quiet xray; then
+    log_info "Xray 启动成功"
+else
+    log_error "Xray 启动失败，请查看日志: journalctl -u xray -f"
+    exit 1
+fi
+
+if ss -tlnp | grep -q ":${INPUT_PORT}"; then
+    log_info "端口 ${INPUT_PORT} 监听正常"
+else
+    log_warn "端口 ${INPUT_PORT} 未检测到监听，请检查: ss -tlnp | grep ${INPUT_PORT}"
+fi
+
+# =============================================================
+# 生成 sing-box 1.13.14 客户端配置
+# =============================================================
+
+SINGBOX_CONFIG_DIR="/root/sing-box-cn-config"
+mkdir -p "${SINGBOX_CONFIG_DIR}"
+
+# -----------------------------------------------------------------
+# 各 OS 的默认 TLS 指纹
+# 用法: get_default_fp <os>
+# -----------------------------------------------------------------
+get_default_fp() {
     case "$1" in
-        ios) echo "safari" ;;
-        linux) echo "firefox" ;;
-        *) echo "chrome" ;;
+        ios)     echo "safari"  ;;
+        macos)   echo "chrome"  ;;
+        android) echo "chrome"  ;;
+        windows) echo "chrome"  ;;
+        linux)   echo "firefox" ;;
+        *)       echo "chrome"  ;;
     esac
 }
 
+# -----------------------------------------------------------------
+# inbounds 生成
+# 用法: generate_inbounds <os>
+# -----------------------------------------------------------------
 generate_inbounds() {
-    local os=$1
+    local os="$1"
     case "$os" in
-        ios|android)
-            cat <<'EOF'
+        ios)
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -525,7 +979,7 @@ generate_inbounds() {
 EOF
             ;;
         macos)
-            cat <<'EOF'
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -542,8 +996,19 @@ EOF
     }
 EOF
             ;;
-        windows|linux)
-            cat <<'EOF'
+        android)
+            cat << 'EOF'
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true,
+      "strict_route": true
+    }
+EOF
+            ;;
+        windows)
+            cat << 'EOF'
     {
       "type": "tun",
       "tag": "tun-in",
@@ -559,21 +1024,41 @@ EOF
     }
 EOF
             ;;
+        linux)
+            cat << 'EOF'
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true,
+      "strict_route": true
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    },
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "::",
+      "listen_port": 7893
+    }
+EOF
+            ;;
     esac
 }
 
-generate_singbox_config() {
-    local os=$1
-    local fingerprint=$2
-    local output_file=$3
-
-    {
-        cat <<EOF
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
+# -----------------------------------------------------------------
+# DNS 生成
+# 用法: generate_dns <route_mode>
+# -----------------------------------------------------------------
+generate_dns() {
+    local mode="$1"
+    case "$mode" in
+        cn)
+            cat << 'EOF'
   "dns": {
     "servers": [
       {
@@ -598,53 +1083,69 @@ generate_singbox_config() {
     "final": "dns-direct",
     "strategy": "ipv4_only"
   },
-  "inbounds": [
 EOF
-        generate_inbounds "$os"
-        cat <<EOF
-  ],
-  "outbounds": [
-    {
-      "type": "vless",
-      "tag": "proxy",
-      "server": "${SERVER_ADDRESS}",
-      "server_port": ${INPUT_PORT},
-      "uuid": "${INPUT_UUID}",
-      "flow": "xtls-rprx-vision",
-      "packet_encoding": "xudp",
-      "tls": {
-        "enabled": true,
-        "server_name": "${INPUT_SNI}",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "${fingerprint}"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "${PUBLIC_KEY}",
-          "short_id": "${SHORT_ID}"
-        }
+            ;;
+        global)
+            cat << 'EOF'
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns-remote",
+        "server": "8.8.8.8",
+        "detour": "proxy"
       }
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
+    ],
+    "final": "dns-remote",
+    "strategy": "ipv4_only"
+  },
+EOF
+            ;;
+        split)
+            cat << 'EOF'
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns-remote",
+        "server": "8.8.8.8",
+        "detour": "proxy"
+      },
+      {
+        "type": "udp",
+        "tag": "dns-local",
+        "server": "223.5.5.5"
+      }
+    ],
     "rules": [
       {
-        "action": "sniff"
-      },
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
-      {
-        "ip_is_private": true,
-        "action": "route",
-        "outbound": "direct"
-      },
+        "rule_set": "geosite-cn",
+        "server": "dns-local"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "ipv4_only"
+  },
+EOF
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------
+# route 生成
+# 使用 sing-box 1.13.14 rule action 配置格式
+# 用法: generate_route <route_mode>
+# -----------------------------------------------------------------
+generate_route() {
+    local mode="$1"
+    case "$mode" in
+        cn)
+            cat << 'EOF'
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "action": "route", "outbound": "direct" },
       {
         "rule_set": ["geoip-cn", "geosite-cn"],
         "action": "route",
@@ -670,80 +1171,365 @@ EOF
     "final": "direct",
     "auto_detect_interface": true,
     "default_domain_resolver": "dns-direct"
+  }
+EOF
+            ;;
+        global)
+            cat << 'EOF'
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-remote"
+  }
+EOF
+            ;;
+        split)
+            cat << 'EOF'
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "rule_set": "geoip-cn", "outbound": "direct" },
+      { "rule_set": "geosite-cn", "outbound": "direct" }
+    ],
+    "rule_set": [
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "download_detour": "proxy"
+      },
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
+        "download_detour": "proxy"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local"
+  }
+EOF
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------
+# 组装并写入单个 sing-box 客户端配置
+# 用法: generate_singbox_config <os> <route_mode> <fingerprint> <output_file>
+# -----------------------------------------------------------------
+generate_singbox_config() {
+    local os="$1"
+    local mode="$2"
+    local fp="$3"
+    local outfile="$4"
+
+    {
+        cat << EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
   },
-  "experimental": {
-    "cache_file": {
-      "enabled": true
+EOF
+        generate_dns "$mode"
+
+        echo '  "inbounds": ['
+        generate_inbounds "$os"
+        echo '  ],'
+
+        cat << EOF
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "${SERVER_IP}",
+      "server_port": ${INPUT_PORT},
+      "uuid": "${INPUT_UUID}",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "${INPUT_SNI}",
+        "utls": { "enabled": true, "fingerprint": "${fp}" },
+        "reality": {
+          "enabled": true,
+          "public_key": "${PUBLIC_KEY}",
+          "short_id": "${SHORT_ID}"
+        }
+      }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+EOF
+        generate_route "$mode"
+
+        echo '}'
+    } > "$outfile"
+
+    # 用 python3 格式化并验证 JSON
+    if command -v python3 &> /dev/null; then
+        if python3 -m json.tool "$outfile" > "$outfile.tmp" 2>/dev/null; then
+            mv "$outfile.tmp" "$outfile"
+        else
+            rm -f "$outfile.tmp"
+            log_warn "JSON 格式验证失败，请手动检查: $outfile"
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------
+# 生成全部客户端配置（5 OS × 1 个回国分流模式 = 5 个文件）
+# -----------------------------------------------------------------
+ALL_OS_LIST=(ios macos android windows linux)
+ALL_ROUTE_LIST=(cn)
+
+log_step "生成全部 sing-box 客户端配置..."
+for _os in "${ALL_OS_LIST[@]}"; do
+    _fp=$(get_default_fp "$_os")
+    # 用户选定的系统使用交互时选择的指纹，与 VLESS 分享链接保持一致
+    [ "$_os" = "$CLIENT_OS" ] && _fp="$CLIENT_FINGERPRINT"
+    for _mode in "${ALL_ROUTE_LIST[@]}"; do
+        _outfile="${SINGBOX_CONFIG_DIR}/config_${_os}_${_mode}.json"
+        generate_singbox_config "$_os" "$_mode" "$_fp" "$_outfile"
+        log_info "  已生成: config_${_os}_${_mode}.json"
+    done
+done
+
+# 当前会话选定的配置（供后续输出引用）
+SINGBOX_CONFIG_FILE="${SINGBOX_CONFIG_DIR}/config_${CLIENT_OS}_${ROUTE_MODE}.json"
+log_info "全部配置已保存至目录: ${SINGBOX_CONFIG_DIR}/"
+
+# =============================================================
+# 生成 VLESS 分享链接
+# =============================================================
+VLESS_LINK="vless://${INPUT_UUID}@${SERVER_IP}:${INPUT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${INPUT_SNI}&fp=${CLIENT_FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#CN-Reality-${CLIENT_OS}"
+
+# =============================================================
+# 最终输出
+# =============================================================
+echo ""
+echo ""
+print_dline
+echo -e "${BOLD}${GREEN}              部署完成！${NC}"
+echo -e "${DIM}              v${SCRIPT_VERSION}  (${SCRIPT_DATE})${NC}"
+print_dline
+
+# ---- 1. 通用客户端参数 ----
+echo ""
+echo -e "${BOLD}${MAGENTA}  ▶ 1. 通用客户端参数${NC}"
+print_line
+echo ""
+echo -e "  协议        : ${GREEN}VLESS${NC}"
+echo -e "  服务器地址  : ${GREEN}${SERVER_IP}${NC}"
+echo -e "  端口        : ${GREEN}${INPUT_PORT}${NC}"
+echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
+echo -e "  Flow        : ${GREEN}xtls-rprx-vision${NC}"
+echo -e "  传输协议    : ${GREEN}tcp${NC}"
+echo -e "  TLS         : ${GREEN}reality${NC}"
+echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
+echo -e "  Public Key  : ${GREEN}${PUBLIC_KEY}${NC}"
+echo -e "  Short ID    : ${GREEN}${SHORT_ID}${NC}"
+echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
+echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
+echo -e "  路由模式    : ${GREEN}中国大陆代理 / 其他直连${NC}"
+echo ""
+
+# ---- 2. 中国大陆出口状态 ----
+if [ "$ENABLE_WARP" = true ]; then
+    echo -e "${BOLD}${MAGENTA}  ▶ 2. WARP 出口信息${NC}"
+    print_line
+    echo ""
+    echo -e "  WARP 状态   : ${GREEN}已启用${NC}"
+    echo -e "  SOCKS5 端口 : ${GREEN}127.0.0.1:${WARP_SOCKS_PORT}${NC}"
+    echo -e "  WARP 出口IP : ${GREEN}${WARP_IP:-未知}${NC}"
+    echo -e "  VPS  原始IP : ${GREEN}${SERVER_IP}${NC}"
+    echo -e "  路由模式    : ${GREEN}${WARP_ROUTE_MODE}${NC}"
+    echo ""
+    echo -e "  ${CYAN}经过 WARP 的域名:${NC}"
+    case "$WARP_ROUTE_MODE" in
+        ai)
+            echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Apple   (apple.com, icloud.com, ...)"
+            ;;
+        ai+google)
+            echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Apple   (apple.com, icloud.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Google  (google.com, youtube.com, ...)"
+            ;;
+        ai+google+netflix)
+            echo -e "    ${GREEN}✓${NC} ChatGPT (openai.com, chatgpt.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Claude  (anthropic.com, claude.ai, ...)"
+            echo -e "    ${GREEN}✓${NC} Apple   (apple.com, icloud.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Google  (google.com, youtube.com, ...)"
+            echo -e "    ${GREEN}✓${NC} Netflix (netflix.com, nflxvideo.net, ...)"
+            ;;
+        all)
+            echo -e "    ${GREEN}✓${NC} 全部出站流量"
+            ;;
+    esac
+    echo ""
+else
+    echo -e "${BOLD}${MAGENTA}  ▶ 2. 中国大陆出口状态${NC}"
+    print_line
+    echo ""
+    echo -e "  WARP 状态   : ${GREEN}不安装、不使用${NC}"
+    echo -e "  中国大陆流量通过 VPS IP (${SERVER_IP}) 出站"
+    echo -e "  其他流量由客户端本地直连"
+    echo ""
+fi
+
+# ---- 3. VLESS 分享链接 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 3. VLESS 分享链接${NC}"
+echo -e "${DIM}  可直接导入 v2rayN / v2rayNG / NekoBox / Shadowrocket${NC}"
+print_line
+echo ""
+echo -e "  ${GREEN}${VLESS_LINK}${NC}"
+echo ""
+
+# ---- 4. sing-box outbound 片段 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 4. sing-box outbound 配置片段${NC}"
+print_line
+echo ""
+cat << EOF
+  {
+    "type": "vless",
+    "tag": "proxy",
+    "server": "${SERVER_IP}",
+    "server_port": ${INPUT_PORT},
+    "uuid": "${INPUT_UUID}",
+    "flow": "xtls-rprx-vision",
+    "packet_encoding": "xudp",
+    "tls": {
+      "enabled": true,
+      "server_name": "${INPUT_SNI}",
+      "utls": { "enabled": true, "fingerprint": "${CLIENT_FINGERPRINT}" },
+      "reality": {
+        "enabled": true,
+        "public_key": "${PUBLIC_KEY}",
+        "short_id": "${SHORT_ID}"
+      }
     }
   }
-}
 EOF
-    } >"$output_file"
+echo ""
 
-    python3 -m json.tool "$output_file" >"${output_file}.formatted"
-    mv "${output_file}.formatted" "$output_file"
-}
+# ---- 5. 全部客户端配置文件列表 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 5. sing-box 客户端配置文件（全平台）${NC}"
+echo -e "  ${DIM}目录: ${SINGBOX_CONFIG_DIR}/${NC}"
+print_line
+echo ""
 
-write_singbox_configs() {
-    log_step "生成 sing-box 1.13.x 客户端配置"
-    mkdir -p "$SINGBOX_CONFIG_DIR"
+_OS_LABELS=(
+    "ios     → sing-box iOS / Stash / Shadowrocket"
+    "macos   → sing-box macOS / V2rayU"
+    "android → sing-box Android / NekoBox / v2rayNG"
+    "windows → sing-box Windows / v2rayN / NekoRay"
+    "linux   → sing-box CLI / 旁路由网关"
+)
+_ROUTE_LABELS=(
+    "cn      回国分流（中国大陆代理 / 其他直连）"
+)
 
-    local os fingerprint output_file
-    for os in ios macos android windows linux; do
-        fingerprint=$(default_fingerprint_for_os "$os")
-        if [[ $os == "$CLIENT_OS" ]]; then
-            fingerprint=$CLIENT_FINGERPRINT
-        fi
-        output_file="${SINGBOX_CONFIG_DIR}/config_${os}_cn.json"
-        generate_singbox_config "$os" "$fingerprint" "$output_file"
-        chmod 0600 "$output_file"
-        log_info "已生成 ${output_file}"
+for _os in "${ALL_OS_LIST[@]}"; do
+    # 找到对应的标签说明
+    _label=""
+    for _l in "${_OS_LABELS[@]}"; do
+        if [[ "$_l" == "${_os}"* ]]; then _label="$_l"; break; fi
     done
+    echo -e "  ${CYAN}${_label}${NC}"
+    for _mode in "${ALL_ROUTE_LIST[@]}"; do
+        _f="${SINGBOX_CONFIG_DIR}/config_${_os}_${_mode}.json"
+        _size=$(wc -c < "$_f" 2>/dev/null || echo "?")
+        printf "    ${GREEN}%-40s${NC}  ${DIM}%s bytes${NC}\n" "config_${_os}_${_mode}.json" "$_size"
+        echo -e "    ${DIM}scp root@${SERVER_IP}:${_f} ./config_${_os}_${_mode}.json${NC}"
+    done
+    echo ""
+done
 
-    SELECTED_CONFIG_FILE="${SINGBOX_CONFIG_DIR}/config_${CLIENT_OS}_cn.json"
-}
+echo -e "  ${YELLOW}一次性下载全部配置到本地当前目录:${NC}"
+echo -e "  ${GREEN}scp -r root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/ ./sing-box-configs/${NC}"
+echo ""
+print_line
+echo ""
 
-print_summary() {
-    local vless_link
-    vless_link="vless://${INPUT_UUID}@${SERVER_ADDRESS}:${INPUT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${INPUT_SNI}&fp=${CLIENT_FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#CN-Reality"
+# ---- 6. Xray 服务端配置 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 6. Xray 服务端配置${NC}"
+echo -e "  ${YELLOW}文件路径: /usr/local/etc/xray/config.json${NC}"
+print_line
+echo ""
+cat /usr/local/etc/xray/config.json
+echo ""
+print_line
+echo ""
 
-    printf '\n%b部署完成%b\n' "$BOLD$GREEN" "$NC"
-    printf '  Xray 服务端配置 : %s\n' "$XRAY_CONFIG_FILE"
-    printf '  sing-box 配置    : %s\n' "$SELECTED_CONFIG_FILE"
-    printf '  客户端要求       : sing-box 1.13.x\n'
-    printf '  WARP             : 未配置、未使用\n'
-    printf '  路由             : 中国大陆 -> proxy；其他 -> direct\n'
-    printf '  中国 DNS         : 223.5.5.5，经大陆 VPS 查询\n\n'
+# ---- 7. 平台使用说明 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 7. ${CLIENT_OS} 平台使用说明${NC}"
+print_line
+echo ""
+case "$CLIENT_OS" in
+    ios)
+        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box iOS / Stash / Shadowrocket${NC}"
+        echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 中新建配置粘贴"
+        echo -e "           或使用 VLESS 分享链接直接导入"
+        echo -e "  ${CYAN}工作原理 :${NC} 系统通过 Network Extension 将全部流量交给 TUN 接口"
+        ;;
+    macos)
+        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box macOS (SFI)${NC}"
+        echo -e "  ${CYAN}TUN 入站 :${NC} 使用 utun0 虚拟网卡接管全局流量"
+        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
+        echo -e "           终端使用: ${GREEN}export https_proxy=http://127.0.0.1:2080${NC}"
+        echo -e "  ${CYAN}首次运行 :${NC} 需在 系统设置 → 隐私与安全性 → VPN 中授权"
+        ;;
+    android)
+        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Android / NekoBox / v2rayNG${NC}"
+        echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 新建配置粘贴"
+        echo -e "           或使用 VLESS 分享链接直接导入"
+        echo -e "  ${CYAN}工作原理 :${NC} 通过 Android VPN Service 创建虚拟网卡"
+        ;;
+    windows)
+        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Windows / v2rayN / NekoRay${NC}"
+        echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管系统流量（需管理员权限运行）"
+        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
+        echo -e "  ${CYAN}注意事项 :${NC} 首次运行会自动安装 WinTun 网卡驱动"
+        ;;
+    linux)
+        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box CLI${NC}"
+        echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管流量（需 root / CAP_NET_ADMIN）"
+        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080  终端: ${GREEN}export all_proxy=socks5://127.0.0.1:2080${NC}"
+        echo -e "  ${CYAN}TProxy   :${NC} 端口 7893 供旁路由/网关透明代理"
+        echo -e "  ${CYAN}启动命令 :${NC} ${GREEN}sudo sing-box run -c ${SINGBOX_CONFIG_FILE}${NC}"
+        ;;
+esac
+echo ""
 
-    printf '%bVLESS 分享链接（仅节点参数，不包含回国分流规则）%b\n%s\n\n' \
-        "$BOLD" "$NC" "$vless_link"
-    printf '下载当前客户端配置：\n'
-    printf '  scp root@%s:%s ./config_%s_cn.json\n\n' \
-        "$SERVER_ADDRESS" "$SELECTED_CONFIG_FILE" "$CLIENT_OS"
-
-    printf '验证命令：\n'
-    printf '  服务端：systemctl status xray --no-pager\n'
-    printf '  客户端：sing-box check -c config_%s_cn.json\n' "$CLIENT_OS"
-    printf '  出口测试：打开中国网站或访问 https://myip.ipip.net\n\n'
-    printf '%b注意：%b如果大陆网站本身拒绝数据中心 IP，即使 IP 位于大陆也可能无法访问。\n' \
-        "$YELLOW" "$NC"
-}
-
-main() {
-    require_root
-    command_exists systemctl || die "本脚本仅支持使用 systemd 的 Linux 发行版"
-    install_dependencies
-    collect_configuration
-    install_xray
-    generate_reality_keys
-    check_reality_target
-    write_xray_config
-    configure_firewall
-    start_xray
-    write_singbox_configs
-    print_summary
-}
-
-if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then
-    main "$@"
+# ---- 8. 常用命令 ----
+echo -e "${BOLD}${MAGENTA}  ▶ 8. 服务器常用命令${NC}"
+print_line
+echo ""
+echo -e "  ${CYAN}Xray 状态      :${NC} ${GREEN}systemctl status xray${NC}"
+echo -e "  ${CYAN}Xray 日志      :${NC} ${GREEN}journalctl -u xray -f${NC}"
+echo -e "  ${CYAN}重启 Xray      :${NC} ${GREEN}systemctl restart xray${NC}"
+echo -e "  ${CYAN}Xray 服务端配置:${NC} ${GREEN}cat /usr/local/etc/xray/config.json${NC}"
+if [ "$ENABLE_WARP" = true ]; then
+    echo -e "  ${CYAN}WARP 状态      :${NC} ${GREEN}warp-cli status${NC}"
+    echo -e "  ${CYAN}WARP 重连      :${NC} ${GREEN}warp-cli disconnect && warp-cli connect${NC}"
+    echo -e "  ${CYAN}测试 WARP IP   :${NC} ${GREEN}curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me${NC}"
 fi
+echo -e "  ${CYAN}下载全部配置   :${NC} ${GREEN}scp -r root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/ ./sing-box-configs/${NC}"
+echo -e "  ${CYAN}下载单个配置   :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/config_<os>_cn.json ./${NC}"
+echo -e "  ${CYAN}查看配置目录   :${NC} ${GREEN}ls -lh ${SINGBOX_CONFIG_DIR}/${NC}"
+echo ""
+print_dline
+echo -e "${BOLD}${RED}  ⚠  请将以上所有信息保存好，私钥不会再次显示！${NC}"
+print_dline
+echo ""
