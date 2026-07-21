@@ -16,13 +16,13 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SCRIPT_DATE="2026-07-21"
 
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 XRAY_CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 SINGBOX_CONFIG_DIR="/root/sing-box-cn-config"
-XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}"
+XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-}"
 
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
@@ -224,13 +224,129 @@ collect_configuration() {
     fi
 }
 
+verify_xray_installer() {
+    local installer=$1
+    [[ -s $installer ]] || return 1
+    bash -n "$installer" >/dev/null 2>&1 || return 1
+    grep -q 'XTLS/Xray-install' "$installer"
+}
+
+download_xray_installer() {
+    local destination=$1
+    local source_file=${CN_XRAY_INSTALLER_FILE:-}
+    local proxy=${CN_XRAY_PROXY:-}
+    local url
+    local urls=()
+    # 与 install.sh 使用相同的 curl 网络行为：不设置连接或总下载时限。
+    # 大陆网络连接 GitHub 可能很慢，过短的超时会误判为下载失败。
+    local curl_args=(-fsSL)
+
+    if [[ -n $source_file ]]; then
+        [[ -f $source_file ]] || {
+            log_error "CN_XRAY_INSTALLER_FILE 不存在：${source_file}"
+            return 1
+        }
+        cp "$source_file" "$destination"
+        verify_xray_installer "$destination" || {
+            log_error "本地 Xray 安装器无效或 Bash 语法不正确：${source_file}"
+            return 1
+        }
+        log_info "使用本地 Xray 官方安装器：${source_file}"
+        return 0
+    fi
+
+    [[ -n $XRAY_INSTALL_URL ]] && urls+=("$XRAY_INSTALL_URL")
+    urls+=(
+        "https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+        "https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+    )
+    [[ -n $proxy ]] && curl_args+=(--proxy "$proxy")
+
+    for url in "${urls[@]}"; do
+        log_info "尝试下载 Xray 官方安装器：${url}"
+        if curl "${curl_args[@]}" "$url" -o "$destination"; then
+            if verify_xray_installer "$destination"; then
+                log_info "Xray 官方安装器下载成功"
+                return 0
+            fi
+            log_warn "下载内容不是有效的 Xray 官方安装器，尝试下一个地址"
+        else
+            log_warn "下载失败，尝试下一个官方地址"
+        fi
+        : >"$destination"
+    done
+
+    return 1
+}
+
+verify_local_xray_archive() {
+    local archive=$1
+    local digest_file=${CN_XRAY_LOCAL_DGST:-${archive}.dgst}
+    local expected_sha=${CN_XRAY_LOCAL_SHA256:-}
+    local actual_sha expected_sha_normalized
+
+    [[ -f $archive ]] || die "CN_XRAY_LOCAL_ZIP 不存在：${archive}"
+    unzip -tq "$archive" >/dev/null || die "本地 Xray ZIP 已损坏：${archive}"
+
+    if [[ -f $digest_file ]]; then
+        expected_sha=$(awk -F '= ' '/256=/ {print $2; exit}' "$digest_file")
+        [[ -n $expected_sha ]] || die "无法从校验文件读取 SHA-256：${digest_file}"
+    fi
+
+    [[ $expected_sha =~ ^[0-9a-fA-F]{64}$ ]] || die \
+        "离线安装必须提供官方校验文件 ${archive}.dgst，或设置 CN_XRAY_LOCAL_SHA256"
+
+    command_exists sha256sum || die "找不到 sha256sum，无法校验本地 Xray ZIP"
+    actual_sha=$(sha256sum "$archive" | awk '{print $1}' | tr 'A-F' 'a-f')
+    expected_sha_normalized=$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')
+    [[ $actual_sha == "$expected_sha_normalized" ]] || die "本地 Xray ZIP 的 SHA-256 校验失败"
+    log_info "本地 Xray ZIP 的 SHA-256 校验通过"
+}
+
 install_xray() {
     log_step "安装或更新 Xray"
+
+    if command_exists xray && [[ -f /etc/systemd/system/xray.service ]] && \
+       [[ ${CN_FORCE_XRAY_UPDATE:-0} != 1 ]] && [[ -z ${CN_XRAY_LOCAL_ZIP:-} ]]; then
+        local installed_version
+        installed_version=$(xray version)
+        log_info "已安装 ${installed_version%%$'\n'*}，跳过联网更新"
+        log_info "如需强制更新，请设置 CN_FORCE_XRAY_UPDATE=1"
+        return 0
+    fi
+
     local installer
+    local local_archive=${CN_XRAY_LOCAL_ZIP:-}
+    local proxy=${CN_XRAY_PROXY:-}
+    local install_status=0
     installer=$(mktemp /tmp/install-cn-xray.XXXXXX.sh)
-    curl -fL --connect-timeout 10 --max-time 120 "$XRAY_INSTALL_URL" -o "$installer"
-    bash "$installer" install
+
+    if ! download_xray_installer "$installer"; then
+        rm -f "$installer"
+        log_error "无法从 Xray 官方 GitHub 地址下载安装器（curl 退出码 28 表示超时）"
+        log_error "可以在美国电脑下载官方安装器和 Xray ZIP，再 scp 到服务器进行离线安装。"
+        log_error "重新运行时设置：CN_XRAY_INSTALLER_FILE、CN_XRAY_LOCAL_ZIP，并提供同名 .dgst 文件。"
+        return 1
+    fi
+
+    if [[ -n $local_archive ]]; then
+        verify_local_xray_archive "$local_archive"
+        bash "$installer" install --local "$local_archive" || install_status=$?
+    elif [[ -n $proxy ]]; then
+        bash "$installer" install --proxy "$proxy" || install_status=$?
+    else
+        bash "$installer" install || install_status=$?
+    fi
     rm -f "$installer"
+
+    if (( install_status != 0 )); then
+        log_error "Xray 官方安装器执行失败（退出码 ${install_status}）"
+        if [[ -z $proxy && -z $local_archive ]]; then
+            log_error "安装器仍需访问 api.github.com 和 GitHub Releases。"
+            log_error "请设置 CN_XRAY_PROXY，或使用 CN_XRAY_LOCAL_ZIP 离线安装。"
+        fi
+        return "$install_status"
+    fi
 
     command_exists xray || die "Xray 安装完成后仍找不到 xray 命令"
     local xray_version
