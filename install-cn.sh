@@ -1,23 +1,22 @@
 #!/bin/bash
 
 # =============================================================
-# Xray 中国大陆网站回国代理一键部署脚本
+# Xray 中国大陆回国代理一键部署脚本
 # 协议: VLESS + Reality + XTLS Vision
-# sing-box 客户端配置语法: 1.13.14
+# sing-box 客户端配置语法: 1.11+（已在 1.13.14 使用）
 #
-# 版本: 1.0.0-cn
-# 日期: 2026-07-21
+# 版本: 1.0.0
+# 日期: 2026-03-17
 # 仓库: https://github.com/your-repo/xray-reality-setup
 #
-# 本脚本以 install.sh 为母版，仅针对回国访问修改：
-#   - 不安装、不使用 Cloudflare WARP
-#   - 中国大陆域名/IP 经大陆 VPS 代理
-#   - 其他流量由美国客户端本地直连
-#   - 生成 sing-box 1.13.14 客户端配置
+# 相对 install.sh 的功能变化仅有：
+#   - 固定关闭 WARP
+#   - 固定选择全局代理
+#   - 全局 DNS 改为经代理访问 223.5.5.5
 # =============================================================
 
 # ---- 版本信息 ----
-SCRIPT_VERSION="1.0.0-cn"
+SCRIPT_VERSION="1.0.0-cn-minimal"
 SCRIPT_DATE="2026-07-21"
 
 set -e
@@ -93,8 +92,8 @@ echo ""
 clear
 echo ""
 print_dline
-echo -e "${BOLD}${MAGENTA}     中国大陆网站回国代理一键部署${NC}"
-echo -e "${DIM}     大陆 VPS 原始出口 · sing-box 1.13.14${NC}"
+echo -e "${BOLD}${MAGENTA}     Xray 中国大陆回国代理一键部署${NC}"
+echo -e "${DIM}     无 WARP · 全部流量走大陆 VPS${NC}"
 echo -e "${DIM}     版本 ${SCRIPT_VERSION}  (${SCRIPT_DATE})${NC}"
 print_dline
 echo ""
@@ -138,72 +137,7 @@ INPUT_SNI=${INPUT_SNI:-cdn.jsdelivr.net}
 # 交互 — 是否启用 WARP
 # =============================================================
 ENABLE_WARP=false
-
-# 回国场景必须保留中国大陆 VPS 原始出口，因此跳过母版的 WARP 交互。
-if false; then
-echo ""
-print_line
-echo -e "${BOLD}  Cloudflare WARP 配置${NC}"
-echo -e "${DIM}  WARP 可以让指定流量通过 Cloudflare 干净 IP 出去${NC}"
-echo -e "${DIM}  避免 VPS IP 被 ChatGPT / Claude 等服务封锁${NC}"
-print_line
-echo ""
-echo -e "  ${GREEN}1)${NC} 启用 WARP   ${YELLOW}← 推荐：ChatGPT + Claude 走 WARP${NC}"
-echo -e "  ${GREEN}2)${NC} 不启用      ${DIM}所有流量直接从 VPS IP 出去${NC}"
-echo ""
-
-while true; do
-    read -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认启用）: '${NC})" WARP_CHOICE
-    WARP_CHOICE=${WARP_CHOICE:-1}
-    case "$WARP_CHOICE" in
-        1) ENABLE_WARP=true;  break ;;
-        2) ENABLE_WARP=false; break ;;
-        *) log_error "无效选项，请输入 1-2" ;;
-    esac
-done
-
-# 如果启用 WARP，询问 SOCKS5 端口
-WARP_SOCKS_PORT=40000
-if [ "$ENABLE_WARP" = true ]; then
-    log_info "已选择启用 WARP"
-    while true; do
-        read -p "$(echo -e ${CYAN}'WARP SOCKS5 本地端口（直接回车使用默认 40000）: '${NC})" WARP_PORT_INPUT
-        WARP_SOCKS_PORT=${WARP_PORT_INPUT:-40000}
-        if [[ "$WARP_SOCKS_PORT" =~ ^[0-9]+$ ]] && [ "$WARP_SOCKS_PORT" -ge 1 ] && [ "$WARP_SOCKS_PORT" -le 65535 ]; then
-            break
-        else
-            log_error "端口号必须在 1-65535 之间"
-        fi
-    done
-
-    # 询问需要走 WARP 的服务
-    echo ""
-    echo -e "  ${BOLD}选择需要走 WARP 出口的服务:${NC}"
-    echo ""
-    echo -e "  ${GREEN}1)${NC} ChatGPT + Claude + Apple          ${YELLOW}← 推荐${NC}"
-    echo -e "  ${GREEN}2)${NC} ChatGPT + Claude + Apple + Google"
-    echo -e "  ${GREEN}3)${NC} ChatGPT + Claude + Apple + Google + Netflix"
-    echo -e "  ${GREEN}4)${NC} 全部流量走 WARP                   ${DIM}(所有出站都经过 Cloudflare)${NC}"
-    echo ""
-
-    while true; do
-        read -p "$(echo -e ${CYAN}'请输入选项 [1-4]（直接回车默认 1）: '${NC})" WARP_ROUTE_CHOICE
-        WARP_ROUTE_CHOICE=${WARP_ROUTE_CHOICE:-1}
-        case "$WARP_ROUTE_CHOICE" in
-            1) WARP_ROUTE_MODE="ai";       break ;;
-            2) WARP_ROUTE_MODE="ai+google"; break ;;
-            3) WARP_ROUTE_MODE="ai+google+netflix"; break ;;
-            4) WARP_ROUTE_MODE="all";      break ;;
-            *) log_error "无效选项，请输入 1-4" ;;
-        esac
-    done
-    log_info "WARP 路由模式: ${WARP_ROUTE_MODE}"
-else
-    log_info "已选择不启用 WARP"
-fi
-fi
-
-log_info "回国模式固定不启用 WARP，目标网站将看到大陆 VPS 的原始出口 IP"
+log_info "回国代理不安装、不使用 WARP"
 
 # =============================================================
 # 交互 — 客户端系统类型
@@ -276,32 +210,8 @@ log_info "已选择 TLS 指纹: ${CLIENT_FINGERPRINT}"
 # =============================================================
 # 交互 — 路由模式
 # =============================================================
-ROUTE_MODE="cn"
-
-# 回国脚本只生成“中国大陆走代理、其他流量直连”这一种分流模式。
-if false; then
-echo ""
-print_line
-echo -e "${BOLD}  请选择 sing-box 客户端路由模式${NC}"
-print_line
-echo ""
-echo -e "  ${GREEN}1)${NC} 全局代理     ${YELLOW}← 所有流量走代理${NC}"
-echo -e "  ${GREEN}2)${NC} 分流模式     ${YELLOW}← 国内直连 + 国外代理 (推荐)${NC}"
-echo ""
-
-while true; do
-    read -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认分流模式）: '${NC})" ROUTE_CHOICE
-    ROUTE_CHOICE=${ROUTE_CHOICE:-2}
-    case "$ROUTE_CHOICE" in
-        1) ROUTE_MODE="global"; break ;;
-        2) ROUTE_MODE="split";  break ;;
-        *) log_error "无效选项，请输入 1-2" ;;
-    esac
-done
-log_info "已选择路由模式: ${ROUTE_MODE}"
-fi
-
-log_info "已固定回国分流模式：中国大陆走代理，其他流量本地直连"
+ROUTE_MODE="global"
+log_info "回国代理固定使用全局模式：全部流量走大陆 VPS"
 
 echo ""
 echo ""
@@ -312,10 +222,10 @@ echo ""
 echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
 echo -e "  端口        : ${GREEN}${INPUT_PORT}${NC}"
 echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
-echo -e "  WARP        : ${GREEN}不安装、不使用${NC}"
+echo -e "  WARP        : ${GREEN}$([ "$ENABLE_WARP" = true ] && echo "启用 (${WARP_ROUTE_MODE})" || echo "未启用")${NC}"
 echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
 echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
-echo -e "  路由模式    : ${GREEN}中国大陆代理 / 其他直连${NC}"
+echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
 echo ""
 read -p "$(echo -e ${CYAN}'确认以上配置开始部署？[Y/n]: '${NC})" CONFIRM
 CONFIRM=${CONFIRM:-Y}
@@ -939,7 +849,7 @@ else
 fi
 
 # =============================================================
-# 生成 sing-box 1.13.14 客户端配置
+# 生成 sing-box 1.11+ 客户端配置
 # =============================================================
 
 SINGBOX_CONFIG_DIR="/root/sing-box-cn-config"
@@ -1057,42 +967,15 @@ EOF
 generate_dns() {
     local mode="$1"
     case "$mode" in
-        cn)
-            cat << 'EOF'
-  "dns": {
-    "servers": [
-      {
-        "type": "local",
-        "tag": "dns-direct"
-      },
-      {
-        "type": "udp",
-        "tag": "dns-cn",
-        "server": "223.5.5.5",
-        "server_port": 53,
-        "detour": "proxy"
-      }
-    ],
-    "rules": [
-      {
-        "rule_set": "geosite-cn",
-        "action": "route",
-        "server": "dns-cn"
-      }
-    ],
-    "final": "dns-direct",
-    "strategy": "ipv4_only"
-  },
-EOF
-            ;;
         global)
             cat << 'EOF'
   "dns": {
     "servers": [
       {
-        "type": "https",
+        "type": "udp",
         "tag": "dns-remote",
-        "server": "8.8.8.8",
+        "server": "223.5.5.5",
+        "server_port": 53,
         "detour": "proxy"
       }
     ],
@@ -1133,47 +1016,12 @@ EOF
 
 # -----------------------------------------------------------------
 # route 生成
-# 使用 sing-box 1.13.14 rule action 配置格式
+# 严格按照实际可工作的 sing-box 1.11+ 配置模板
 # 用法: generate_route <route_mode>
 # -----------------------------------------------------------------
 generate_route() {
     local mode="$1"
     case "$mode" in
-        cn)
-            cat << 'EOF'
-  "route": {
-    "rules": [
-      { "action": "sniff" },
-      { "protocol": "dns", "action": "hijack-dns" },
-      { "ip_is_private": true, "action": "route", "outbound": "direct" },
-      {
-        "rule_set": ["geoip-cn", "geosite-cn"],
-        "action": "route",
-        "outbound": "proxy"
-      }
-    ],
-    "rule_set": [
-      {
-        "tag": "geoip-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-        "download_detour": "direct"
-      },
-      {
-        "tag": "geosite-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
-        "download_detour": "direct"
-      }
-    ],
-    "final": "direct",
-    "auto_detect_interface": true,
-    "default_domain_resolver": "dns-direct"
-  }
-EOF
-            ;;
         global)
             cat << 'EOF'
   "route": {
@@ -1286,10 +1134,10 @@ EOF
 }
 
 # -----------------------------------------------------------------
-# 生成全部客户端配置（5 OS × 1 个回国分流模式 = 5 个文件）
+# 生成全部客户端配置（5 OS × 全局模式 = 5 个文件）
 # -----------------------------------------------------------------
 ALL_OS_LIST=(ios macos android windows linux)
-ALL_ROUTE_LIST=(cn)
+ALL_ROUTE_LIST=(global)
 
 log_step "生成全部 sing-box 客户端配置..."
 for _os in "${ALL_OS_LIST[@]}"; do
@@ -1310,7 +1158,7 @@ log_info "全部配置已保存至目录: ${SINGBOX_CONFIG_DIR}/"
 # =============================================================
 # 生成 VLESS 分享链接
 # =============================================================
-VLESS_LINK="vless://${INPUT_UUID}@${SERVER_IP}:${INPUT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${INPUT_SNI}&fp=${CLIENT_FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#CN-Reality-${CLIENT_OS}"
+VLESS_LINK="vless://${INPUT_UUID}@${SERVER_IP}:${INPUT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${INPUT_SNI}&fp=${CLIENT_FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Reality-${CLIENT_OS}"
 
 # =============================================================
 # 最终输出
@@ -1339,10 +1187,10 @@ echo -e "  Public Key  : ${GREEN}${PUBLIC_KEY}${NC}"
 echo -e "  Short ID    : ${GREEN}${SHORT_ID}${NC}"
 echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
 echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
-echo -e "  路由模式    : ${GREEN}中国大陆代理 / 其他直连${NC}"
+echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
 echo ""
 
-# ---- 2. 中国大陆出口状态 ----
+# ---- 2. WARP 状态 ----
 if [ "$ENABLE_WARP" = true ]; then
     echo -e "${BOLD}${MAGENTA}  ▶ 2. WARP 出口信息${NC}"
     print_line
@@ -1379,12 +1227,11 @@ if [ "$ENABLE_WARP" = true ]; then
     esac
     echo ""
 else
-    echo -e "${BOLD}${MAGENTA}  ▶ 2. 中国大陆出口状态${NC}"
+    echo -e "${BOLD}${MAGENTA}  ▶ 2. WARP 状态${NC}"
     print_line
     echo ""
-    echo -e "  WARP 状态   : ${GREEN}不安装、不使用${NC}"
-    echo -e "  中国大陆流量通过 VPS IP (${SERVER_IP}) 出站"
-    echo -e "  其他流量由客户端本地直连"
+    echo -e "  WARP 状态   : ${YELLOW}未启用${NC}"
+    echo -e "  所有流量通过 VPS IP (${SERVER_IP}) 直接出站"
     echo ""
 fi
 
@@ -1437,7 +1284,8 @@ _OS_LABELS=(
     "linux   → sing-box CLI / 旁路由网关"
 )
 _ROUTE_LABELS=(
-    "cn      回国分流（中国大陆代理 / 其他直连）"
+    "global  全局代理（所有流量走代理）"
+    "split   分流模式（国内直连 / 国外代理）"
 )
 
 for _os in "${ALL_OS_LIST[@]}"; do
@@ -1526,7 +1374,7 @@ if [ "$ENABLE_WARP" = true ]; then
     echo -e "  ${CYAN}测试 WARP IP   :${NC} ${GREEN}curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me${NC}"
 fi
 echo -e "  ${CYAN}下载全部配置   :${NC} ${GREEN}scp -r root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/ ./sing-box-configs/${NC}"
-echo -e "  ${CYAN}下载单个配置   :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/config_<os>_cn.json ./${NC}"
+echo -e "  ${CYAN}下载单个配置   :${NC} ${GREEN}scp root@${SERVER_IP}:${SINGBOX_CONFIG_DIR}/config_<os>_<mode>.json ./${NC}"
 echo -e "  ${CYAN}查看配置目录   :${NC} ${GREEN}ls -lh ${SINGBOX_CONFIG_DIR}/${NC}"
 echo ""
 print_dline
