@@ -545,6 +545,8 @@ if [ "$ENABLE_WARP" = true ]; then
             log_warn "  warp-cli connect"
             log_warn "  warp-cli status"
             log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
+            log_error "WARP 连接超时，停止部署；不会自动改为直连。连接恢复后请重新运行脚本。"
+            exit 1
         fi
 
         # 设置 WARP 开机自启
