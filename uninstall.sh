@@ -9,6 +9,8 @@ set -uo pipefail
 
 ASSUME_YES=0
 DRY_RUN=0
+REMOVAL_PATHS=()
+XRAY_UNITS=()
 
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
@@ -90,6 +92,7 @@ run_cmd() {
 
 remove_file() {
     local path=$1
+    REMOVAL_PATHS+=("$path")
     if [[ -e $path || -L $path ]]; then
         run_cmd rm -f -- "$path"
     elif (( DRY_RUN )); then
@@ -99,7 +102,8 @@ remove_file() {
 
 remove_directory() {
     local path=$1
-    if [[ -d $path || -L $path ]]; then
+    REMOVAL_PATHS+=("$path")
+    if [[ -e $path || -L $path ]]; then
         run_cmd rm -rf -- "$path"
     elif (( DRY_RUN )); then
         printf '[DRY-RUN] rm -rf -- %q  # 当前不存在\n' "$path"
@@ -116,22 +120,47 @@ confirm_uninstall() {
         return 0
     fi
 
-    local answer
-    read -r -p "输入 YES 确认卸载: " answer
+    local answer=""
+    read -r -p "输入 YES 确认卸载: " answer || answer=""
     if [[ $answer != YES ]]; then
         log_info "已取消卸载"
         exit 0
     fi
 }
 
-stop_xray() {
-    log_step "停止并禁用 Xray 服务"
+# 不对不存在的服务执行 stop；通信失败必须显式报错。
+stop_service() {
+    local unit=$1 state
+    state=$(systemctl show "$unit" --property=LoadState --value) || return 1
+    if [[ $state == not-found ]]; then
+        return 0
+    fi
+    [[ -n $state ]] || return 1
+    run_cmd systemctl stop "$unit" || return 1
+    run_cmd systemctl disable "$unit" || return 1
+    run_cmd systemctl reset-failed "$unit" || return 1
+}
 
-    if command -v systemctl >/dev/null 2>&1; then
-        run_cmd systemctl disable --now xray.service || true
-        run_cmd systemctl disable --now xray@.service || true
-    else
-        log_warn "未找到 systemctl，继续清理已知文件"
+stop_xray() {
+    log_step "停止并禁用 Xray 服务及实例"
+    local units files unit
+    units=$(systemctl list-units --all --plain --no-legend 'xray@*.service') || return 1
+    files=$(systemctl list-unit-files --no-legend 'xray@*.service') || return 1
+    XRAY_UNITS=("xray.service")
+    while read -r unit _; do
+        if [[ $unit == xray@*.service && $unit != xray@.service ]]; then
+            XRAY_UNITS+=("$unit")
+        fi
+    done <<< "$(printf '%s\n%s\n' "$units" "$files" | sort -u)"
+    for unit in ${XRAY_UNITS[@]+"${XRAY_UNITS[@]}"}; do
+        stop_service "$unit" || return 1
+    done
+    # 官方安装器可能创建此定时任务。
+    stop_service logrotate@xray.timer || return 1
+    stop_service logrotate@xray.service || return 1
+    if (( ! DRY_RUN )) && pgrep -x xray >/dev/null; then
+        log_error "仍有 Xray 进程运行，请先停止手动启动或其他管理器启动的实例"
+        return 1
     fi
 }
 
@@ -156,15 +185,14 @@ remove_xray_files() {
     local path
 
     for path in "${files[@]}"; do
-        remove_file "$path"
+        remove_file "$path" || return 1
     done
     for path in "${directories[@]}"; do
-        remove_directory "$path"
+        remove_directory "$path" || return 1
     done
 
     if command -v systemctl >/dev/null 2>&1; then
-        run_cmd systemctl daemon-reload
-        run_cmd systemctl reset-failed xray.service || true
+        run_cmd systemctl daemon-reload || return 1
     fi
 }
 
@@ -177,49 +205,52 @@ stop_warp() {
     log_step "停止 WARP 并删除注册状态"
 
     if command -v warp-cli >/dev/null 2>&1; then
-        run_cmd warp-cli --accept-tos disconnect || true
-        run_cmd warp-cli --accept-tos registration delete || true
+        run_cmd warp-cli --accept-tos disconnect || log_warn "WARP 断开命令失败，将继续停止服务"
+        run_cmd warp-cli --accept-tos registration delete || log_warn "未能通过 WARP 守护进程删除注册；服务停止后将清理本地注册状态"
     elif (( DRY_RUN )); then
         printf '[DRY-RUN] warp-cli --accept-tos disconnect  # 当前未安装\n'
         printf '[DRY-RUN] warp-cli --accept-tos registration delete  # 当前未安装\n'
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
-        run_cmd systemctl disable --now warp-svc.service || true
+        stop_service warp-svc.service || return 1
     fi
+    if (( ! DRY_RUN )) && pgrep -x warp-svc >/dev/null; then
+        log_error "仍有 warp-svc 进程运行，停止清理以免运行中的服务重写注册状态"
+        return 1
+    fi
+}
+
+# config-files、半安装等状态也需要 purge。
+deb_package_present() {
+    local status
+    status=$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null) || return 1
+    [[ -n $status && $status != *" not-installed" ]]
 }
 
 remove_warp_package() {
     log_step "卸载 Cloudflare WARP 软件包"
-    local removed=0
-
-    if command -v dpkg-query >/dev/null 2>&1 && \
-       dpkg-query -W -f='${Status}' cloudflare-warp 2>/dev/null | grep -q 'install ok installed'; then
-        if run_cmd apt-get purge -y cloudflare-warp; then
-            removed=1
-        else
-            log_warn "apt-get 未能卸载 cloudflare-warp，继续清理已知文件"
+    local package manager
+    if command -v dpkg-query >/dev/null 2>&1; then
+        if deb_package_present cloudflare-warp; then
+            run_cmd apt-get purge -y cloudflare-warp || return 1
         fi
-    elif command -v rpm >/dev/null 2>&1 && rpm -q cloudflare-warp >/dev/null 2>&1; then
-        if command -v dnf >/dev/null 2>&1; then
-            run_cmd dnf remove -y cloudflare-warp || log_warn "dnf 未能卸载 cloudflare-warp"
-        elif command -v yum >/dev/null 2>&1; then
-            run_cmd yum remove -y cloudflare-warp || log_warn "yum 未能卸载 cloudflare-warp"
-        fi
-        removed=1
-    elif (( DRY_RUN )); then
-        printf '[DRY-RUN] 卸载 cloudflare-warp 软件包  # 当前未检测到\n'
+    elif command -v rpm >/dev/null 2>&1; then
+        for package in cloudflare-warp cloudflare-release; do
+            if rpm -q "$package" >/dev/null 2>&1; then
+                if command -v dnf >/dev/null 2>&1; then
+                    manager=dnf
+                elif command -v yum >/dev/null 2>&1; then
+                    manager=yum
+                else
+                    log_error "检测到 $package，但找不到 dnf/yum，无法卸载"
+                    return 1
+                fi
+                run_cmd "$manager" remove -y "$package" || return 1
+            fi
+        done
     fi
-
-    if command -v rpm >/dev/null 2>&1 && rpm -q cloudflare-release >/dev/null 2>&1; then
-        if command -v dnf >/dev/null 2>&1; then
-            run_cmd dnf remove -y cloudflare-release || true
-        elif command -v yum >/dev/null 2>&1; then
-            run_cmd yum remove -y cloudflare-release || true
-        fi
-    fi
-
-    (( removed == 1 )) && log_info "Cloudflare WARP 软件包卸载步骤已执行"
+    return 0
 }
 
 remove_warp_files() {
@@ -229,8 +260,10 @@ remove_warp_files() {
         "/etc/apt/sources.list.d/cloudflare-client.list"
         "/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
         "/etc/systemd/system/warp-svc.service"
+        "/etc/systemd/system/multi-user.target.wants/warp-svc.service"
     )
     local directories=(
+        "/etc/systemd/system/warp-svc.service.d"
         "/etc/cloudflare-warp"
         "/var/lib/cloudflare-warp"
         "/var/log/cloudflare-warp"
@@ -238,46 +271,76 @@ remove_warp_files() {
     local path
 
     for path in "${files[@]}"; do
-        remove_file "$path"
+        remove_file "$path" || return 1
     done
     for path in "${directories[@]}"; do
-        remove_directory "$path"
+        remove_directory "$path" || return 1
     done
 
     if command -v systemctl >/dev/null 2>&1; then
-        run_cmd systemctl daemon-reload
-        run_cmd systemctl reset-failed warp-svc.service || true
+        run_cmd systemctl daemon-reload || return 1
     fi
 }
 
 verify_removal() {
     (( DRY_RUN )) && return 0
-
+    local failed=0 name path state
     hash -r
-    if command -v xray >/dev/null 2>&1; then
-        log_warn "PATH 中仍能找到 xray：$(command -v xray)；它可能由其他方式安装"
-    else
-        log_info "Xray 已移除"
+    for name in xray warp-cli warp-svc; do
+        if command -v "$name" >/dev/null 2>&1; then
+            log_error "仍能找到程序: $(command -v "$name")；请检查是否由其他方式安装"
+            failed=1
+        fi
+    done
+    for path in ${REMOVAL_PATHS[@]+"${REMOVAL_PATHS[@]}"}; do
+        if [[ -e $path || -L $path ]]; then
+            log_error "残留文件或目录: $path"
+            failed=1
+        fi
+    done
+    for name in ${XRAY_UNITS[@]+"${XRAY_UNITS[@]}"} xray@.service warp-svc.service; do
+        state=$(systemctl show "$name" --property=LoadState --value) || return 1
+        if [[ $state != not-found ]]; then
+            log_error "服务仍存在或无法确认已移除: $name ($state)"
+            failed=1
+        fi
+    done
+    if command -v dpkg-query >/dev/null 2>&1 && deb_package_present cloudflare-warp; then
+        log_error "cloudflare-warp 软件包或包配置仍存在"
+        failed=1
     fi
-
-    if command -v warp-cli >/dev/null 2>&1; then
-        log_warn "PATH 中仍能找到 warp-cli：$(command -v warp-cli)"
-    else
-        log_info "Cloudflare WARP 已移除"
+    if command -v rpm >/dev/null 2>&1; then
+        for name in cloudflare-warp cloudflare-release; do
+            if rpm -q "$name" >/dev/null 2>&1; then
+                log_error "软件包仍存在: $name"
+                failed=1
+            fi
+        done
     fi
+    return "$failed"
 }
 
 main() {
     parse_args "$@"
     require_root
     confirm_uninstall
-    stop_xray
-    remove_xray_files
-    remove_original_client_configs
-    stop_warp
-    remove_warp_package
-    remove_warp_files
-    verify_removal
+    # 安装脚本要求 systemd；无法管理服务时不冒险删除运行中的文件。
+    if ! command -v systemctl >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1; then
+        log_error "需要 systemctl 和 pgrep，无法安全确认服务已经停止"
+        return 1
+    fi
+    local step
+    for step in stop_xray stop_warp remove_xray_files remove_original_client_configs \
+        remove_warp_package remove_warp_files verify_removal; do
+        if ! "$step"; then
+            log_error "卸载未完成（步骤: ${step}）。请解决上述错误后重新运行 uninstall.sh。"
+            return 1
+        fi
+    done
+    if (( DRY_RUN )); then
+        log_info "预演完成，未修改系统，也未执行实际卸载验证。"
+        return 0
+    fi
 
     printf '\n%b原版代理及 WARP 卸载完成。%b\n' "$BOLD$GREEN" "$NC"
     log_info "系统依赖和防火墙/安全组规则保持不变。"

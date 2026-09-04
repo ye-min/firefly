@@ -72,6 +72,46 @@ if ! command -v systemctl >/dev/null 2>&1 \
     exit 1
 fi
 
+# 仅允许全新安装；检查必须在更新软件包和修改系统之前执行。
+check_existing_installation() {
+    local name path state
+    local -a found=()
+    for name in xray warp-cli warp-svc; do
+        if command -v "$name" >/dev/null 2>&1; then
+            found+=("程序: $name")
+        fi
+    done
+    for path in /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray \
+        /usr/local/lib/xray /var/log/xray /root/sing-box-config \
+        /etc/cloudflare-warp /var/lib/cloudflare-warp /var/log/cloudflare-warp \
+        /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+        /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
+        /etc/systemd/system/warp-svc.service; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            found+=("安装文件或残留: $path")
+        fi
+    done
+    for name in xray.service xray@.service warp-svc.service; do
+        state=$(systemctl show "$name" --property=LoadState --value 2>/dev/null) || state=""
+        if [ -n "$state" ] && [ "$state" != not-found ]; then
+            found+=("systemd 服务: $name")
+        fi
+    done
+    if command -v dpkg-query >/dev/null 2>&1 \
+        && dpkg-query -W -f='${Status}' cloudflare-warp 2>/dev/null | grep -q 'install ok installed'; then
+        found+=("软件包: cloudflare-warp")
+    elif command -v rpm >/dev/null 2>&1 && rpm -q cloudflare-warp >/dev/null 2>&1; then
+        found+=("软件包: cloudflare-warp")
+    fi
+    if [ "${#found[@]}" -gt 0 ]; then
+        log_error "检测到 Xray / WARP 已安装或存在残留，本脚本仅支持全新安装。"
+        printf '  - %s\n' "${found[@]}"
+        log_warn "请先运行 sudo bash uninstall.sh，确认卸载干净后再运行 install.sh。"
+        return 1
+    fi
+}
+check_existing_installation
+
 # =============================================================
 # 系统更新与依赖安装
 # =============================================================
@@ -439,8 +479,8 @@ if [ "$ENABLE_WARP" = true ]; then
             ubuntu|debian)
                 if [ -z "$OS_VERSION" ]; then
                     log_error "无法获取系统版本代号（VERSION_CODENAME 为空），请手动安装 cloudflare-warp"
-                    log_warn "跳过 WARP 安装，其他配置将继续..."
-                    ENABLE_WARP=false
+                    log_error "WARP 无法安装，停止部署；不会自动改为直连。手动安装完成后请重新运行脚本。"
+                    exit 1
                 else
                     # 添加 Cloudflare GPG key 和仓库
                     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
@@ -468,8 +508,8 @@ if [ "$ENABLE_WARP" = true ]; then
                 ;;
             *)
                 log_error "不支持的系统: ${OS_ID}，请手动安装 cloudflare-warp"
-                log_warn "跳过 WARP 安装，其他配置将继续..."
-                ENABLE_WARP=false
+                log_error "WARP 无法安装，停止部署；不会自动改为直连。手动安装完成后请重新运行脚本。"
+                exit 1
                 ;;
         esac
     else
@@ -480,39 +520,43 @@ if [ "$ENABLE_WARP" = true ]; then
     if [ "$ENABLE_WARP" = true ] && command -v warp-cli &> /dev/null; then
         log_info "配置 WARP 客户端..."
 
-        # 等待 warp-svc 守护进程完全就绪
-        # 刚安装完 cloudflare-warp 后，warp-svc 需要几秒钟来初始化
-        # 如果在这之前就调用 warp-cli，会出现 "Registration Missing
-        # due to: Daemon Startup" 之类的错误
-        log_info "等待 WARP 守护进程就绪..."
-        for i in $(seq 1 15); do
-            if warp-cli --accept-tos status 2>/dev/null | grep -qi "Disconnected\|Connected"; then
-                log_info "WARP 守护进程已就绪"
-                break
+        # 全新安装只创建注册，不删除或覆盖已有注册。
+        # 先确认守护进程和注册状态，不能把通信失败当成未注册。
+        create_warp_registration() {
+            local registration_info registration_state="" i
+            if ! systemctl enable --now warp-svc; then
+                log_error "无法启动 WARP 守护进程，停止部署"
+                return 1
             fi
-            if [ "$i" -eq 15 ]; then
-                log_warn "等待超时，继续尝试..."
+            log_info "等待 WARP 守护进程就绪..."
+            for i in $(seq 1 15); do
+                if registration_info=$(LC_ALL=C warp-cli --accept-tos registration show 2>&1); then
+                    registration_state="registered"
+                    break
+                elif printf '%s\n' "$registration_info" | grep -qi "Registration Missing" \
+                    && ! printf '%s\n' "$registration_info" | grep -qi "Daemon Startup"; then
+                    registration_state="missing"
+                    break
+                fi
+                sleep 2
+            done
+            if [ -z "$registration_state" ]; then
+                log_error "无法确认 WARP 注册状态，停止部署；请检查 warp-svc 日志"
+                return 1
             fi
-            sleep 2
-        done
 
-        # 注册 WARP
-        # 判断是否已经注册：精确匹配 "Registration Missing" 或 "Unable to"，
-        # 避免 "Missing" 单独匹配到其他无关状态消息
-        WARP_STATUS_CHECK=$(warp-cli --accept-tos status 2>&1 || true)
-        if echo "$WARP_STATUS_CHECK" | grep -qi "Registration Missing\|Unable to"; then
-            log_info "注册 WARP..."
-            warp-cli --accept-tos registration new
-            sleep 3
-            log_info "WARP 注册完成"
-        elif echo "$WARP_STATUS_CHECK" | grep -qi "Disconnected\|Connected"; then
-            log_info "WARP 已注册，跳过注册步骤"
-        else
-            # 无法判断状态，尝试注册一次（重复注册不会出错）
-            log_info "WARP 状态不确定，尝试注册..."
-            warp-cli --accept-tos registration new 2>/dev/null || true
-            sleep 3
-        fi
+            if [ "$registration_state" = registered ]; then
+                log_error "检测到已有 WARP 注册，请先运行 uninstall.sh 后重新安装。"
+                return 1
+            fi
+            log_info "创建新的 WARP 注册..."
+            if ! warp-cli --accept-tos registration new; then
+                log_error "WARP 注册失败，停止部署；请先运行 uninstall.sh 清理后重新安装"
+                return 1
+            fi
+            log_info "WARP 新注册已创建"
+        }
+        create_warp_registration
 
         # 设置为 proxy 模式（仅开 SOCKS5 端口，不接管系统全部流量）
         #
@@ -569,7 +613,6 @@ if [ "$ENABLE_WARP" = true ]; then
             log_warn "这通常是因为 WARP 守护进程刚启动需要更多时间"
             log_warn "请稍后手动执行以下命令来完成连接:"
             log_warn "  warp-cli disconnect"
-            log_warn "  warp-cli registration new"
             log_warn "  warp-cli mode proxy"
             log_warn "  warp-cli proxy port ${WARP_SOCKS_PORT}"
             log_warn "  warp-cli connect"
@@ -579,8 +622,6 @@ if [ "$ENABLE_WARP" = true ]; then
             exit 1
         fi
 
-        # 设置 WARP 开机自启
-        systemctl enable warp-svc 2>/dev/null || true
 
     fi
 fi
