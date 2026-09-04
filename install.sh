@@ -3,7 +3,7 @@
 # =============================================================
 # Xray 一键部署脚本
 # 协议: VLESS + Reality + XTLS Vision
-# sing-box 客户端配置语法: 1.11+
+# sing-box 客户端配置语法: 1.13+
 #
 # 版本: 1.0.0
 # 日期: 2026-03-17
@@ -16,7 +16,7 @@
 #     - 客户端系统选择 (iOS/macOS/Android/Windows/Linux)
 #     - TLS 指纹选择（根据系统自动推荐）
 #     - 路由模式选择（全局代理 / 国内外分流）
-#     - 生成完整 sing-box 1.11+ 客户端 JSON 配置
+#     - 生成完整 sing-box 1.13+ 客户端 JSON 配置
 #     - 生成 VLESS 分享链接
 #     - 系统依赖自动安装 (apt/yum/dnf/apk)
 #
@@ -110,7 +110,7 @@ clear
 echo ""
 print_dline
 echo -e "${BOLD}${MAGENTA}     Xray VLESS + Reality 一键部署${NC}"
-echo -e "${DIM}     含 Cloudflare WARP · sing-box 1.11+ 语法${NC}"
+echo -e "${DIM}     含 Cloudflare WARP · sing-box 1.13+ 语法${NC}"
 echo -e "${DIM}     版本 ${SCRIPT_VERSION}  (${SCRIPT_DATE})${NC}"
 print_dline
 echo ""
@@ -941,7 +941,7 @@ else
 fi
 
 # =============================================================
-# 生成 sing-box 1.11+ 客户端配置
+# 生成 sing-box 1.13+ 客户端配置
 # =============================================================
 
 SINGBOX_CONFIG_DIR="/root/sing-box-config"
@@ -1107,7 +1107,7 @@ EOF
 
 # -----------------------------------------------------------------
 # route 生成
-# 严格按照实际可工作的 sing-box 1.11+ 配置模板
+# 严格按照实际可工作的 sing-box 1.13+ 配置模板
 # 用法: generate_route <route_mode>
 # -----------------------------------------------------------------
 generate_route() {
