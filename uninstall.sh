@@ -138,7 +138,22 @@ stop_service() {
     [[ -n $state ]] || return 1
     run_cmd systemctl stop "$unit" || return 1
     run_cmd systemctl disable "$unit" || return 1
-    run_cmd systemctl reset-failed "$unit" || return 1
+    if (( DRY_RUN )); then
+        run_cmd systemctl reset-failed "$unit"
+        return $?
+    fi
+    # 正常停止的 unit 可能已被 systemd 回收，无需再 reset-failed。
+    # 仅重置仍处于 failed 状态的 unit；状态查询失败不能当作已停止。
+    state=$(systemctl show "$unit" --property=ActiveState --value) || return 1
+    case "$state" in
+        failed) run_cmd systemctl reset-failed "$unit" || return 1 ;;
+        inactive) ;;
+        *)
+            log_error "服务尚未停止或状态未知: $unit ($state)"
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 stop_xray() {
@@ -285,7 +300,7 @@ remove_warp_files() {
 
 verify_removal() {
     (( DRY_RUN )) && return 0
-    local failed=0 name path state
+    local failed=0 name path state template_files
     hash -r
     for name in xray warp-cli warp-svc; do
         if command -v "$name" >/dev/null 2>&1; then
@@ -299,13 +314,19 @@ verify_removal() {
             failed=1
         fi
     done
-    for name in ${XRAY_UNITS[@]+"${XRAY_UNITS[@]}"} xray@.service warp-svc.service; do
+    for name in ${XRAY_UNITS[@]+"${XRAY_UNITS[@]}"} warp-svc.service; do
         state=$(systemctl show "$name" --property=LoadState --value) || return 1
         if [[ $state != not-found ]]; then
             log_error "服务仍存在或无法确认已移除: $name ($state)"
             failed=1
         fi
     done
+    # 模板没有实例，不能用 systemctl show 查询运行时属性。
+    template_files=$(systemctl list-unit-files --no-legend --no-pager xray@.service) || return 1
+    if [[ -n $template_files ]]; then
+        log_error "服务模板仍存在: xray@.service"
+        failed=1
+    fi
     if command -v dpkg-query >/dev/null 2>&1 && deb_package_present cloudflare-warp; then
         log_error "cloudflare-warp 软件包或包配置仍存在"
         failed=1

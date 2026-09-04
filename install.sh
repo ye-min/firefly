@@ -654,7 +654,7 @@ if [ "$ENABLE_WARP" = true ]; then
                 if registration_info=$(LC_ALL=C warp-cli --accept-tos registration show 2>&1); then
                     registration_state="registered"
                     break
-                elif printf '%s\n' "$registration_info" | grep -qi "Registration Missing" \
+                elif printf '%s\n' "$registration_info" | grep -Eqi 'missing[[:space:]]+registration|registration[[:space:]]+missing' \
                     && ! printf '%s\n' "$registration_info" | grep -qi "Daemon Startup"; then
                     registration_state="missing"
                     break
@@ -1098,6 +1098,7 @@ fi
 log_step "配置防火墙..."
 configure_firewall() {
     local port="$1" ufw_status configured=false
+    local addresses route_info interface zone
     if command -v ufw >/dev/null 2>&1; then
         if ! ufw_status=$(LC_ALL=C ufw status); then
             log_error "无法读取 UFW 状态，停止部署"
@@ -1111,9 +1112,44 @@ configure_firewall() {
     fi
     # 两种防火墙都启用时分别放行；不启动原本停用的防火墙。
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --add-port="${port}/tcp" || return 1
-        firewall-cmd --add-port="${port}/tcp" || return 1
-        log_info "firewalld 已放行端口 ${port}（持久和运行时规则）"
+        # 优先匹配服务器公网地址；使用 NAT 的 VPS 则通过公网路由确定网卡。
+        if ! addresses=$(ip -o -4 addr show); then
+            log_error "无法读取网卡地址，停止配置 firewalld"
+            return 1
+        fi
+        interface=$(printf '%s\n' "$addresses" | awk -v server_ip="$SERVER_IP" '
+            $3 == "inet" { split($4, address, "/"); if (address[1] == server_ip) { print $2; exit } }')
+        if [ -z "$interface" ]; then
+            if ! route_info=$(ip -4 route get 1.1.1.1); then
+                log_error "无法确定公网路由网卡，停止配置 firewalld"
+                return 1
+            fi
+            interface=$(printf '%s\n' "$route_info" | awk '
+                { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+        fi
+        interface=${interface%%@*}
+        if [ -z "$interface" ]; then
+            log_error "无法确定公网网卡，停止配置 firewalld"
+            return 1
+        fi
+
+        if zone=$(LC_ALL=C firewall-cmd --get-zone-of-interface="$interface"); then
+            :
+        elif [ "$zone" != "no zone" ]; then
+            log_error "无法查询网卡 ${interface} 的 firewalld zone，停止部署"
+            return 1
+        fi
+        # 未显式绑定 zone 的网卡使用默认区域；查询失败不能当作未绑定。
+        if [ "$zone" = "no zone" ]; then
+            zone=$(firewall-cmd --get-default-zone) || return 1
+        fi
+        if [ -z "$zone" ]; then
+            log_error "firewalld 返回空 zone，停止部署"
+            return 1
+        fi
+        firewall-cmd --permanent --zone="$zone" --add-port="${port}/tcp" || return 1
+        firewall-cmd --zone="$zone" --add-port="${port}/tcp" || return 1
+        log_info "firewalld 已在 ${interface} 所属 zone ${zone} 放行端口 ${port}（持久和运行时规则）"
         configured=true
     fi
     if [ "$configured" = false ]; then
@@ -1211,7 +1247,6 @@ EOF
     {
       "type": "tun",
       "tag": "tun-in",
-      "interface_name": "utun0",
       "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
       "auto_route": true,
       "strict_route": true
@@ -1650,7 +1685,7 @@ case "$CLIENT_OS" in
         ;;
     macos)
         echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box macOS (SFI)${NC}"
-        echo -e "  ${CYAN}TUN 入站 :${NC} 使用 utun0 虚拟网卡接管全局流量"
+        echo -e "  ${CYAN}TUN 入站 :${NC} 自动选择可用的 utun 虚拟网卡接管全局流量"
         echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
         echo -e "           终端使用: ${GREEN}export https_proxy=http://127.0.0.1:2080${NC}"
         echo -e "  ${CYAN}首次运行 :${NC} 需在 系统设置 → 隐私与安全性 → VPN 中授权"
