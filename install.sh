@@ -18,7 +18,7 @@
 #     - 路由模式选择（全局代理 / 国内外分流）
 #     - 生成完整 sing-box 1.13+ 客户端 JSON 配置
 #     - 生成 VLESS 分享链接
-#     - 系统依赖自动安装 (apt/yum/dnf/apk)
+#     - 系统依赖自动安装 (apt/yum/dnf，仅支持 systemd 环境)
 #
 # WARP 工作原理:
 #   VPS 上安装 Cloudflare WARP 客户端后，它会在本地开一个
@@ -65,6 +65,13 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# 官方 Xray 安装器及后续服务管理均依赖 systemd。
+if ! command -v systemctl >/dev/null 2>&1 \
+    || [ ! -d /run/systemd/system ]; then
+    log_error "此脚本需要正在运行的 systemd，不支持 Alpine/OpenRC 环境"
+    exit 1
+fi
+
 # =============================================================
 # 系统更新与依赖安装
 # =============================================================
@@ -92,10 +99,6 @@ elif command -v yum &> /dev/null; then
     # CentOS / RHEL 旧版
     yum update -y
     yum install -y unzip curl openssl wget ca-certificates gnupg2
-elif command -v apk &> /dev/null; then
-    # Alpine
-    apk update && apk upgrade
-    apk add --no-cache unzip curl openssl wget ca-certificates gnupg
 else
     log_warn "未识别的包管理器，请确保系统已更新且已安装: unzip curl openssl wget"
 fi
