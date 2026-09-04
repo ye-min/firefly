@@ -205,8 +205,21 @@ while true; do
 done
 
 # ---- SNI ----
-read -p "$(echo -e ${CYAN}'请输入 SNI 域名（直接回车使用默认 cdn.jsdelivr.net）: '${NC})" INPUT_SNI
-INPUT_SNI=${INPUT_SNI:-cdn.jsdelivr.net}
+is_valid_sni() {
+    local LC_ALL=C domain="$1"
+    # 裸域名总长不超过 253，每段 1-63 字符，连字符不能位于段首或段尾。
+    [[ ${#domain} -le 253 && "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
+        && [[ ! "$domain" =~ ^[0-9.]+$ ]]
+}
+
+while true; do
+    IFS= read -r -p "$(echo -e ${CYAN}'请输入 SNI 域名（直接回车使用默认 cdn.jsdelivr.net）: '${NC})" INPUT_SNI
+    INPUT_SNI=${INPUT_SNI:-cdn.jsdelivr.net}
+    if is_valid_sni "$INPUT_SNI"; then
+        break
+    fi
+    log_error "SNI 必须是有效的裸域名（如 cdn.jsdelivr.net），不能包含协议、端口、路径、空格或引号，也不能使用 IP 地址"
+done
 
 # =============================================================
 # 交互 — 是否启用 WARP
@@ -849,14 +862,23 @@ build_warp_domain_rules() {
 # =============================================================
 # 写入 Xray 服务端配置
 # =============================================================
+secure_xray_config() {
+    local path="$1" service_user service_uid
+    if ! service_user=$(systemctl show xray.service --property=User --value); then
+        log_error "无法读取 Xray 服务账户，停止设置配置权限"
+        return 1
+    fi
+    # systemd 系统服务未设置 User 时以 root 运行。
+    service_user=${service_user:-root}
+    service_uid=$(id -u "$service_user") || return 1
+    # 服务账户只读，root 仍可管理；不向同组或其他用户开放密钥。
+    chmod 400 "$path" || return 1
+    chown "${service_uid}:0" "$path"
+}
+
 log_step "生成 Xray 服务端候选配置..."
+# mktemp 的 root/600 权限保护写入过程，完成后再授予服务账户读取权限。
 XRAY_CANDIDATE=$(mktemp "${XRAY_CONFIG}.new.XXXXXX")
-# 继承现有配置的属主和权限，使服务账户仍可读取配置。
-if [ -f "$XRAY_CONFIG" ]; then
-    cp -p "$XRAY_CONFIG" "$XRAY_CANDIDATE"
-else
-    chmod 644 "$XRAY_CANDIDATE"
-fi
 
 # 根据是否启用 WARP 以及路由模式，生成不同的服务端配置
 if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
@@ -1078,6 +1100,7 @@ else
 EOF
 fi
 
+secure_xray_config "$XRAY_CANDIDATE"
 log_info "服务端候选配置已生成"
 
 # =============================================================
