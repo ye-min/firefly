@@ -139,7 +139,9 @@ done
 while true; do
     read -p "$(echo -e ${CYAN}'请输入监听端口（直接回车使用默认 443）: '${NC})" INPUT_PORT
     INPUT_PORT=${INPUT_PORT:-443}
-    if [[ "$INPUT_PORT" =~ ^[0-9]+$ ]] && [ "$INPUT_PORT" -ge 1 ] && [ "$INPUT_PORT" -le 65535 ]; then
+    # 去掉前导零；限制有效位数，避免超长数字触发整数比较错误。
+    INPUT_PORT=$(printf '%s' "$INPUT_PORT" | sed 's/^0*//')
+    if [[ "$INPUT_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$INPUT_PORT" -ge 1 ] && [ "$INPUT_PORT" -le 65535 ]; then
         break
     else
         log_error "端口号必须在 1-65535 之间"
@@ -181,7 +183,9 @@ if [ "$ENABLE_WARP" = true ]; then
     while true; do
         read -p "$(echo -e ${CYAN}'WARP SOCKS5 本地端口（直接回车使用默认 40000）: '${NC})" WARP_PORT_INPUT
         WARP_SOCKS_PORT=${WARP_PORT_INPUT:-40000}
-        if [[ "$WARP_SOCKS_PORT" =~ ^[0-9]+$ ]] && [ "$WARP_SOCKS_PORT" -ge 1 ] && [ "$WARP_SOCKS_PORT" -le 65535 ]; then
+        # 去掉前导零；限制有效位数，避免超长数字触发整数比较错误。
+        WARP_SOCKS_PORT=$(printf '%s' "$WARP_SOCKS_PORT" | sed 's/^0*//')
+        if [[ "$WARP_SOCKS_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$WARP_SOCKS_PORT" -ge 1 ] && [ "$WARP_SOCKS_PORT" -le 65535 ]; then
             break
         else
             log_error "端口号必须在 1-65535 之间"
