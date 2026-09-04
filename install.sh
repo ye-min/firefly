@@ -340,6 +340,10 @@ echo ""
 # =============================================================
 # 安装 Xray
 # =============================================================
+# 记录安装器运行前是否已有配置，避免把首次安装产生的占位配置当作可回滚配置。
+XRAY_CONFIG=/usr/local/etc/xray/config.json
+XRAY_HAD_CONFIG=false
+[ ! -f "$XRAY_CONFIG" ] || XRAY_HAD_CONFIG=true
 log_step "安装 Xray..."
 bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 log_info "Xray 安装完成"
@@ -701,12 +705,20 @@ build_warp_domain_rules() {
 # =============================================================
 # 写入 Xray 服务端配置
 # =============================================================
-log_step "写入 Xray 服务端配置文件..."
+log_step "生成 Xray 服务端候选配置..."
+XRAY_CANDIDATE=$(mktemp "${XRAY_CONFIG}.new.XXXXXX")
+trap 'rm -f -- "$XRAY_CANDIDATE"' EXIT
+# 继承现有配置的属主和权限，使服务账户仍可读取配置。
+if [ -f "$XRAY_CONFIG" ]; then
+    cp -p "$XRAY_CONFIG" "$XRAY_CANDIDATE"
+else
+    chmod 644 "$XRAY_CANDIDATE"
+fi
 
 # 根据是否启用 WARP 以及路由模式，生成不同的服务端配置
 if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
     # ---- 全部流量走 WARP：default outbound 改为 warp ----
-    cat > /usr/local/etc/xray/config.json << EOF
+    cat > "$XRAY_CANDIDATE" << EOF
 {
   "log": {
     "loglevel": "warning"
@@ -783,7 +795,7 @@ elif [ "$ENABLE_WARP" = true ]; then
     # 先构建域名列表
     WARP_DOMAIN_JSON=$(build_warp_domain_rules)
 
-    cat > /usr/local/etc/xray/config.json << EOF
+    cat > "$XRAY_CANDIDATE" << EOF
 {
   "log": {
     "loglevel": "warning"
@@ -862,7 +874,7 @@ EOF
 
 else
     # ---- 不启用 WARP，纯 freedom 出站 ----
-    cat > /usr/local/etc/xray/config.json << EOF
+    cat > "$XRAY_CANDIDATE" << EOF
 {
   "log": {
     "loglevel": "warning"
@@ -923,13 +935,13 @@ else
 EOF
 fi
 
-log_info "服务端配置已写入 /usr/local/etc/xray/config.json"
+log_info "服务端候选配置已生成"
 
 # =============================================================
 # 验证配置
 # =============================================================
 log_step "验证配置文件..."
-if xray run -test -config /usr/local/etc/xray/config.json; then
+if xray run -test -config "$XRAY_CANDIDATE"; then
     log_info "配置文件验证通过"
 else
     log_error "配置文件验证失败，请检查"
@@ -956,14 +968,35 @@ fi
 # =============================================================
 log_step "启动 Xray 服务..."
 systemctl enable xray
-systemctl restart xray
-
-sleep 2
-
-if systemctl is-active --quiet xray; then
+XRAY_BACKUP=""
+if [ "$XRAY_HAD_CONFIG" = true ]; then
+    XRAY_BACKUP=$(mktemp "${XRAY_CONFIG}.backup.XXXXXX")
+    cp -p "$XRAY_CONFIG" "$XRAY_BACKUP"
+    log_info "原配置已备份: ${XRAY_BACKUP}"
+fi
+# 同目录重命名，避免正式配置出现部分写入状态。
+mv -f "$XRAY_CANDIDATE" "$XRAY_CONFIG"
+if systemctl restart xray && sleep 2 && systemctl is-active --quiet xray; then
     log_info "Xray 启动成功"
+    if [ "$XRAY_HAD_CONFIG" = true ]; then
+        log_warn "重新部署已生成新密钥和 Short ID，请更新客户端配置。"
+    fi
 else
-    log_error "Xray 启动失败，请查看日志: journalctl -u xray -f"
+    log_error "新配置启动失败，请查看日志: journalctl -u xray -n 50 --no-pager"
+    if [ -n "$XRAY_BACKUP" ]; then
+        # 通过临时文件恢复，保留备份供后续排查。
+        if cp -p "$XRAY_BACKUP" "$XRAY_CANDIDATE" && mv -f "$XRAY_CANDIDATE" "$XRAY_CONFIG"; then
+            if systemctl restart xray && sleep 2 && systemctl is-active --quiet xray; then
+                log_warn "已恢复原配置，Xray 服务已重新启动。部署未完成。"
+            else
+                log_error "原配置已恢复，但 Xray 仍无法启动，请检查服务日志。"
+            fi
+        else
+            log_error "恢复原配置失败，请手动恢复备份: ${XRAY_BACKUP}"
+        fi
+    else
+        log_error "首次安装没有原配置可恢复，请检查当前配置和服务日志。"
+    fi
     exit 1
 fi
 
