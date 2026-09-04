@@ -364,10 +364,33 @@ SHORT_ID=$(openssl rand -hex 8)
 # ---- 获取服务器 IP ----
 # 强制 IPv4：服务端监听 0.0.0.0（仅 IPv4），且 IPv6 地址写入
 # VLESS 链接时需要加方括号，统一取 IPv4 避免生成不可用的配置
-SERVER_IP=$(curl -4s --max-time 5 ifconfig.me 2>/dev/null \
-         || curl -4s --max-time 5 ip.sb 2>/dev/null \
-         || curl -4s --max-time 5 ipinfo.io/ip 2>/dev/null \
-         || echo "YOUR_SERVER_IP")
+get_server_ipv4() {
+    local url candidate octet valid
+    local -a octets
+    for url in https://ifconfig.me/ip https://api.ip.sb/ip https://ipinfo.io/ip; do
+        candidate=$(curl -4fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null) || continue
+        [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
+        IFS=. read -r -a octets <<< "$candidate"
+        valid=true
+        for octet in "${octets[@]}"; do
+            # 拒绝前导零，避免客户端对地址产生不同解释。
+            if [[ ${#octet} -gt 1 && "$octet" == 0* ]] || (( 10#$octet > 255 )); then
+                valid=false
+                break
+            fi
+        done
+        if [ "$valid" = true ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! SERVER_IP=$(get_server_ipv4); then
+    log_error "所有公网 IP 接口均请求失败或返回无效 IPv4，停止部署。请检查网络后重试。"
+    exit 1
+fi
 
 echo ""
 print_dline
