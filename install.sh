@@ -13,8 +13,8 @@
 #   v1.0.0  2026-03-17  首个正式版本
 #     - 一键部署 Xray VLESS+Reality 服务端
 #     - Cloudflare WARP 集成 (ChatGPT/Claude/Google/Netflix)
-#     - 客户端系统选择 (iOS/macOS/Android/Windows/Linux)
-#     - TLS 指纹选择（根据系统自动推荐）
+#     - 始终生成全平台客户端配置 (iOS/macOS/Android/Windows/Linux)
+#     - 各平台自动使用默认 TLS 指纹
 #     - 路由模式选择（全局代理 / 国内外分流）
 #     - 生成完整 sing-box 1.13+ 客户端 JSON 配置
 #     - 生成 VLESS 分享链接
@@ -292,74 +292,6 @@ else
 fi
 
 # =============================================================
-# 交互 — 客户端系统类型
-# =============================================================
-echo ""
-print_line
-echo -e "${BOLD}  请选择客户端系统类型${NC}"
-echo -e "${DIM}  (不同系统的 sing-box inbounds 配置有本质区别)${NC}"
-print_line
-echo ""
-echo -e "  ${GREEN}1)${NC} iOS          ${YELLOW}← Stash / Shadowrocket / sing-box iOS${NC}"
-echo -e "  ${GREEN}2)${NC} macOS        ${YELLOW}← sing-box macOS (SFI) / V2rayU${NC}"
-echo -e "  ${GREEN}3)${NC} Android      ${YELLOW}← sing-box Android / NekoBox / v2rayNG${NC}"
-echo -e "  ${GREEN}4)${NC} Windows      ${YELLOW}← sing-box Windows / v2rayN / NekoRay${NC}"
-echo -e "  ${GREEN}5)${NC} Linux        ${YELLOW}← sing-box CLI / 旁路由网关${NC}"
-echo ""
-
-while true; do
-    read -p "$(echo -e ${CYAN}'请输入选项 [1-5]（直接回车默认 iOS）: '${NC})" OS_CHOICE
-    OS_CHOICE=${OS_CHOICE:-1}
-    case "$OS_CHOICE" in
-        1) CLIENT_OS="ios";     break ;;
-        2) CLIENT_OS="macos";   break ;;
-        3) CLIENT_OS="android"; break ;;
-        4) CLIENT_OS="windows"; break ;;
-        5) CLIENT_OS="linux";   break ;;
-        *) log_error "无效选项，请输入 1-5" ;;
-    esac
-done
-log_info "已选择客户端系统: ${CLIENT_OS}"
-
-# =============================================================
-# 交互 — TLS 指纹
-# =============================================================
-case "$CLIENT_OS" in
-    ios)     DEFAULT_FP="safari";  DEFAULT_FP_NUM=3 ;;
-    macos)   DEFAULT_FP="chrome";  DEFAULT_FP_NUM=1 ;;
-    android) DEFAULT_FP="chrome";  DEFAULT_FP_NUM=1 ;;
-    windows) DEFAULT_FP="chrome";  DEFAULT_FP_NUM=1 ;;
-    linux)   DEFAULT_FP="firefox"; DEFAULT_FP_NUM=2 ;;
-esac
-
-echo ""
-print_line
-echo -e "${BOLD}  请选择 TLS 客户端指纹 (uTLS Fingerprint)${NC}"
-echo -e "${DIM}  (已根据客户端系统推荐默认值)${NC}"
-print_line
-echo ""
-echo -e "  ${GREEN}1)${NC} chrome       $([ "$DEFAULT_FP" = "chrome"  ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
-echo -e "  ${GREEN}2)${NC} firefox      $([ "$DEFAULT_FP" = "firefox" ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
-echo -e "  ${GREEN}3)${NC} safari       $([ "$DEFAULT_FP" = "safari"  ] && echo -e "${YELLOW}← 推荐${NC}" || echo "")"
-echo -e "  ${GREEN}4)${NC} edge"
-echo -e "  ${GREEN}5)${NC} random       ${DIM}(随机指纹)${NC}"
-echo ""
-
-while true; do
-    read -p "$(echo -e ${CYAN}"请输入选项 [1-5]（直接回车默认 ${DEFAULT_FP}）: "${NC})" FP_CHOICE
-    FP_CHOICE=${FP_CHOICE:-$DEFAULT_FP_NUM}
-    case "$FP_CHOICE" in
-        1) CLIENT_FINGERPRINT="chrome";  break ;;
-        2) CLIENT_FINGERPRINT="firefox"; break ;;
-        3) CLIENT_FINGERPRINT="safari";  break ;;
-        4) CLIENT_FINGERPRINT="edge";    break ;;
-        5) CLIENT_FINGERPRINT="random";  break ;;
-        *) log_error "无效选项，请输入 1-5" ;;
-    esac
-done
-log_info "已选择 TLS 指纹: ${CLIENT_FINGERPRINT}"
-
-# =============================================================
 # 交互 — 路由模式
 # =============================================================
 echo ""
@@ -392,8 +324,8 @@ echo -e "  UUID        : ${GREEN}${INPUT_UUID}${NC}"
 echo -e "  端口        : ${GREEN}${INPUT_PORT}${NC}"
 echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
 echo -e "  WARP        : ${GREEN}$([ "$ENABLE_WARP" = true ] && echo "启用 (${WARP_ROUTE_MODE})" || echo "未启用")${NC}"
-echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
-echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
+echo -e "  客户端配置  : ${GREEN}全平台（iOS / macOS / Android / Windows / Linux）${NC}"
+echo -e "  TLS 指纹    : ${GREEN}iOS=safari，Linux=firefox，其他平台=chrome${NC}"
 echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
 echo ""
 read -p "$(echo -e ${CYAN}'确认以上配置开始部署？[Y/n]: '${NC})" CONFIRM
@@ -622,8 +554,15 @@ if [ "$ENABLE_WARP" = true ]; then
                     exit 1
                 else
                     # 添加 Cloudflare GPG key 和仓库
-                    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-                        | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+                    # 仅在此管道启用 pipefail，确保 curl 和 gpg 任一步失败都会停止部署。
+                    if ! (
+                        set -o pipefail
+                        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+                            | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+                    ); then
+                        log_error "WARP 公钥下载或转换失败，停止部署；请检查网络及上方 curl/gpg 错误"
+                        exit 1
+                    fi
 
                     echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${OS_VERSION} main" \
                         > /etc/apt/sources.list.d/cloudflare-client.list
@@ -1517,8 +1456,6 @@ ALL_ROUTE_LIST=(global split)
 log_step "生成全部 sing-box 客户端配置..."
 for _os in "${ALL_OS_LIST[@]}"; do
     _fp=$(get_default_fp "$_os")
-    # 用户选定的系统使用交互时选择的指纹，与 VLESS 分享链接保持一致
-    [ "$_os" = "$CLIENT_OS" ] && _fp="$CLIENT_FINGERPRINT"
     for _mode in "${ALL_ROUTE_LIST[@]}"; do
         _outfile="${SINGBOX_CONFIG_DIR}/config_${_os}_${_mode}.json"
         generate_singbox_config "$_os" "$_mode" "$_fp" "$_outfile"
@@ -1526,14 +1463,16 @@ for _os in "${ALL_OS_LIST[@]}"; do
     done
 done
 
-# 当前会话选定的配置（供后续输出引用）
-SINGBOX_CONFIG_FILE="${SINGBOX_CONFIG_DIR}/config_${CLIENT_OS}_${ROUTE_MODE}.json"
 log_info "全部配置已保存至目录: ${SINGBOX_CONFIG_DIR}/"
 
 # =============================================================
-# 生成 VLESS 分享链接
+# 按平台默认指纹生成 VLESS 分享链接
 # =============================================================
-VLESS_LINK="vless://${INPUT_UUID}@${SERVER_IP}:${INPUT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${INPUT_SNI}&fp=${CLIENT_FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Reality-${CLIENT_OS}"
+generate_vless_link() {
+    local os="$1" fp
+    fp=$(get_default_fp "$os")
+    printf '%s\n' "vless://${INPUT_UUID}@${SERVER_IP}:${INPUT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${INPUT_SNI}&fp=${fp}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Reality-${os}"
+}
 
 # =============================================================
 # 最终输出
@@ -1560,8 +1499,8 @@ echo -e "  TLS         : ${GREEN}reality${NC}"
 echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
 echo -e "  Public Key  : ${GREEN}${PUBLIC_KEY}${NC}"
 echo -e "  Short ID    : ${GREEN}${SHORT_ID}${NC}"
-echo -e "  客户端系统  : ${GREEN}${CLIENT_OS}${NC}"
-echo -e "  TLS 指纹    : ${GREEN}${CLIENT_FINGERPRINT}${NC}"
+echo -e "  客户端配置  : ${GREEN}全平台（iOS / macOS / Android / Windows / Linux）${NC}"
+echo -e "  TLS 指纹    : ${GREEN}iOS=safari，Linux=firefox，其他平台=chrome${NC}"
 echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
 echo ""
 
@@ -1611,18 +1550,24 @@ else
 fi
 
 # ---- 3. VLESS 分享链接 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 3. VLESS 分享链接${NC}"
+echo -e "${BOLD}${MAGENTA}  ▶ 3. VLESS 分享链接（按平台）${NC}"
 echo -e "${DIM}  可直接导入 v2rayN / v2rayNG / NekoBox / Shadowrocket${NC}"
 print_line
 echo ""
-echo -e "  ${GREEN}${VLESS_LINK}${NC}"
-echo ""
+for _os in "${ALL_OS_LIST[@]}"; do
+    echo -e "  ${CYAN}${_os}（TLS 指纹: $(get_default_fp "$_os")）${NC}"
+    echo -e "  ${GREEN}$(generate_vless_link "$_os")${NC}"
+    echo ""
+done
 
 # ---- 4. sing-box outbound 片段 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 4. sing-box outbound 配置片段${NC}"
+echo -e "${BOLD}${MAGENTA}  ▶ 4. sing-box outbound 配置片段（按平台）${NC}"
 print_line
 echo ""
-cat << EOF
+for _os in "${ALL_OS_LIST[@]}"; do
+    _fp=$(get_default_fp "$_os")
+    echo -e "  ${CYAN}${_os}（TLS 指纹: ${_fp}）${NC}"
+    cat << EOF
   {
     "type": "vless",
     "tag": "proxy",
@@ -1634,7 +1579,7 @@ cat << EOF
     "tls": {
       "enabled": true,
       "server_name": "${INPUT_SNI}",
-      "utls": { "enabled": true, "fingerprint": "${CLIENT_FINGERPRINT}" },
+      "utls": { "enabled": true, "fingerprint": "${_fp}" },
       "reality": {
         "enabled": true,
         "public_key": "${PUBLIC_KEY}",
@@ -1643,7 +1588,8 @@ cat << EOF
     }
   }
 EOF
-echo ""
+    echo ""
+done
 
 # ---- 5. 全部客户端配置文件列表 ----
 echo -e "${BOLD}${MAGENTA}  ▶ 5. sing-box 客户端配置文件（全平台）${NC}"
@@ -1696,44 +1642,51 @@ print_line
 echo ""
 
 # ---- 7. 平台使用说明 ----
-echo -e "${BOLD}${MAGENTA}  ▶ 7. ${CLIENT_OS} 平台使用说明${NC}"
+echo -e "${BOLD}${MAGENTA}  ▶ 7. 各平台使用说明${NC}"
 print_line
 echo ""
-case "$CLIENT_OS" in
-    ios)
-        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box iOS / Stash / Shadowrocket${NC}"
-        echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 中新建配置粘贴"
-        echo -e "           或使用 VLESS 分享链接直接导入"
-        echo -e "  ${CYAN}工作原理 :${NC} 系统通过 Network Extension 将全部流量交给 TUN 接口"
-        ;;
-    macos)
-        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box macOS (SFI)${NC}"
-        echo -e "  ${CYAN}TUN 入站 :${NC} 自动选择可用的 utun 虚拟网卡接管全局流量"
-        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
-        echo -e "           终端使用: ${GREEN}export https_proxy=http://127.0.0.1:2080${NC}"
-        echo -e "  ${CYAN}首次运行 :${NC} 需在 系统设置 → 隐私与安全性 → VPN 中授权"
-        ;;
-    android)
-        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Android / NekoBox / v2rayNG${NC}"
-        echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 新建配置粘贴"
-        echo -e "           或使用 VLESS 分享链接直接导入"
-        echo -e "  ${CYAN}工作原理 :${NC} 通过 Android VPN Service 创建虚拟网卡"
-        ;;
-    windows)
-        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Windows / v2rayN / NekoRay${NC}"
-        echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管系统流量（需管理员权限运行）"
-        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
-        echo -e "  ${CYAN}注意事项 :${NC} 首次运行会自动安装 WinTun 网卡驱动"
-        ;;
-    linux)
-        echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box CLI${NC}"
-        echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管流量（需 root / CAP_NET_ADMIN）"
-        echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080  终端: ${GREEN}export all_proxy=socks5://127.0.0.1:2080${NC}"
-        echo -e "  ${CYAN}TProxy   :${NC} 端口 7893 供旁路由/网关透明代理"
-        echo -e "  ${CYAN}启动命令 :${NC} ${GREEN}sudo sing-box run -c ${SINGBOX_CONFIG_FILE}${NC}"
-        ;;
-esac
-echo ""
+print_platform_instructions() {
+    case "$1" in
+        ios)
+            echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box iOS / Stash / Shadowrocket${NC}"
+            echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 中新建配置粘贴"
+            echo -e "           或使用 VLESS 分享链接直接导入"
+            echo -e "  ${CYAN}工作原理 :${NC} 系统通过 Network Extension 将全部流量交给 TUN 接口"
+            ;;
+        macos)
+            echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box macOS (SFI)${NC}"
+            echo -e "  ${CYAN}TUN 入站 :${NC} 自动选择可用的 utun 虚拟网卡接管全局流量"
+            echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
+            echo -e "           终端使用: ${GREEN}export https_proxy=http://127.0.0.1:2080${NC}"
+            echo -e "  ${CYAN}首次运行 :${NC} 需在 系统设置 → 隐私与安全性 → VPN 中授权"
+            ;;
+        android)
+            echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Android / NekoBox / v2rayNG${NC}"
+            echo -e "  ${CYAN}导入方式 :${NC} 复制完整 JSON → App 新建配置粘贴"
+            echo -e "           或使用 VLESS 分享链接直接导入"
+            echo -e "  ${CYAN}工作原理 :${NC} 通过 Android VPN Service 创建虚拟网卡"
+            ;;
+        windows)
+            echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box Windows / v2rayN / NekoRay${NC}"
+            echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管系统流量（需管理员权限运行）"
+            echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080 (HTTP + SOCKS5)"
+            echo -e "  ${CYAN}注意事项 :${NC} 首次运行会自动安装 WinTun 网卡驱动"
+            ;;
+        linux)
+            echo -e "  ${CYAN}推荐客户端:${NC} ${GREEN}sing-box CLI${NC}"
+            echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管流量（需 root / CAP_NET_ADMIN）"
+            echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080  终端: ${GREEN}export all_proxy=socks5://127.0.0.1:2080${NC}"
+            echo -e "  ${CYAN}TProxy   :${NC} 端口 7893 供旁路由/网关透明代理"
+            echo -e "  ${CYAN}启动命令 :${NC} ${GREEN}sudo sing-box run -c ./config_linux_${ROUTE_MODE}.json${NC}"
+            ;;
+    esac
+}
+for _os in "${ALL_OS_LIST[@]}"; do
+    echo -e "  ${BOLD}${CYAN}${_os}${NC}"
+    echo -e "  ${CYAN}配置文件 :${NC} ${GREEN}config_${_os}_${ROUTE_MODE}.json${NC}"
+    print_platform_instructions "$_os"
+    echo ""
+done
 
 # ---- 8. 常用命令 ----
 echo -e "${BOLD}${MAGENTA}  ▶ 8. 服务器常用命令${NC}"
