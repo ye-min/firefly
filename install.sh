@@ -338,18 +338,19 @@ bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-rele
 log_info "Xray 安装完成"
 
 # ---- 生成密钥对 ----
-# xray x25519 输出格式 (现代版本):
-#   Private key: xxxx
-#   Public key:  xxxx
-# 使用 sed 提取冒号后的内容并去除首尾空白，兼容不同版本的输出格式
-KEYPAIR=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private" | sed 's/.*:[[:space:]]*//')
-PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "public" | sed 's/.*:[[:space:]]*//')
+# 兼容 Private key / PrivateKey，以及 Public key / PublicKey /
+# Password / Password (PublicKey)；仅匹配字段名，不将 Hash32 当作公钥。
+if ! KEYPAIR=$(xray x25519); then
+    log_error "xray x25519 执行失败，无法生成密钥对"
+    exit 1
+fi
+PRIVATE_KEY=$(printf '%s\n' "$KEYPAIR" | sed -nE 's/^[[:space:]]*[Pp]rivate[[:space:]]*[Kk]ey:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p')
+PUBLIC_KEY=$(printf '%s\n' "$KEYPAIR" | sed -nE 's/^[[:space:]]*([Pp]ublic[[:space:]]*[Kk]ey|[Pp]assword([[:space:]]*\([Pp]ublic[Kk]ey\))?):[[:space:]]*([^[:space:]]+)[[:space:]]*$/\3/p')
 
-# 验证密钥不为空
-if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-    log_error "密钥对生成失败，请检查 xray x25519 输出:"
-    echo "$KEYPAIR"
+# X25519 的 32 字节密钥编码为无填充 Base64URL 后应为 43 个字符。
+# 未知字段、空值、重复字段或异常格式均停止部署，不输出包含私钥的原文。
+if [[ ! "$PRIVATE_KEY" =~ ^[A-Za-z0-9_-]{43}$ || ! "$PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+    log_error "无法识别 xray x25519 的密钥输出，或密钥格式异常；部署已停止。请检查 Xray 版本及输出字段名称（不要公开私钥）"
     exit 1
 fi
 
