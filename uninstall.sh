@@ -258,6 +258,7 @@ remove_warp_files() {
 
     local files=(
         "/etc/apt/sources.list.d/cloudflare-client.list"
+        "/etc/yum.repos.d/cloudflare-warp.repo"
         "/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
         "/etc/systemd/system/warp-svc.service"
         "/etc/systemd/system/multi-user.target.wants/warp-svc.service"

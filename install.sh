@@ -130,21 +130,34 @@ if command -v apt-get &> /dev/null; then
     apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || \
         log_warn "系统软件包升级过程中有警告，继续执行..."
     log_info "系统软件包已升级"
-    apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release
+    apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release iproute2
 elif command -v dnf &> /dev/null; then
     # Fedora / 新版 RHEL 系（dnf 优先于 yum，因为 yum 在 RHEL8+ 仅是 dnf 的别名）
     dnf update -y
-    dnf install -y unzip curl openssl wget ca-certificates gnupg2
+    dnf install -y unzip curl openssl wget ca-certificates gnupg2 iproute
 elif command -v yum &> /dev/null; then
     # CentOS / RHEL 旧版
     yum update -y
-    yum install -y unzip curl openssl wget ca-certificates gnupg2
+    yum install -y unzip curl openssl wget ca-certificates gnupg2 iproute
 else
     log_warn "未识别的包管理器，请确保系统已更新且已安装: unzip curl openssl wget"
 fi
 
 log_info "系统更新与依赖安装完成"
 echo ""
+
+check_tcp_port_available() {
+    local port="$1" listeners
+    if ! listeners=$(ss -H -ltn "sport = :${port}"); then
+        log_error "无法检查 TCP 端口 ${port}；请确认已安装 iproute2/iproute，且 ss 可以运行"
+        return 1
+    fi
+    if [ -n "$listeners" ]; then
+        log_error "TCP 端口 ${port} 已被占用，请停止占用进程或选择其他端口"
+        return 1
+    fi
+    return 0
+}
 
 # =============================================================
 # 欢迎界面
@@ -229,6 +242,10 @@ if [ "$ENABLE_WARP" = true ]; then
         # 去掉前导零；限制有效位数，避免超长数字触发整数比较错误。
         WARP_SOCKS_PORT=$(printf '%s' "$WARP_SOCKS_PORT" | sed 's/^0*//')
         if [[ "$WARP_SOCKS_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$WARP_SOCKS_PORT" -ge 1 ] && [ "$WARP_SOCKS_PORT" -le 65535 ]; then
+            if [ "$WARP_SOCKS_PORT" -eq "$INPUT_PORT" ]; then
+                log_error "WARP SOCKS5 端口不能与 Xray 监听端口相同，请重新输入"
+                continue
+            fi
             break
         else
             log_error "端口号必须在 1-65535 之间"
@@ -373,6 +390,12 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
+# 在安装 Xray/WARP 前检查两个端口，避免部署到一半才发现冲突。
+check_tcp_port_available "$INPUT_PORT"
+if [ "$ENABLE_WARP" = true ]; then
+    check_tcp_port_available "$WARP_SOCKS_PORT"
+fi
+
 echo ""
 log_info "开始部署..."
 echo ""
@@ -384,8 +407,52 @@ echo ""
 XRAY_CONFIG=/usr/local/etc/xray/config.json
 XRAY_HAD_CONFIG=false
 [ ! -f "$XRAY_CONFIG" ] || XRAY_HAD_CONFIG=true
+XRAY_INSTALLER=""
+XRAY_CANDIDATE=""
+INSTALLATION_STARTED=false
+finish_installation() {
+    local status=$?
+    # 只清理本次临时文件，不自动卸载或删除服务配置。
+    if [ -n "$XRAY_INSTALLER" ]; then rm -f -- "$XRAY_INSTALLER" || true; fi
+    if [ -n "$XRAY_CANDIDATE" ]; then rm -f -- "$XRAY_CANDIDATE" || true; fi
+    if [ "$status" -ne 0 ] && [ "$INSTALLATION_STARTED" = true ]; then
+        log_warn "本次部署未完成，可能已留下 Xray/WARP 安装文件。本脚本仅支持全新安装。"
+        log_warn "排查原因后，请先运行 sudo bash uninstall.sh，确认卸载成功，再运行 sudo bash install.sh。"
+    fi
+    return "$status"
+}
+trap finish_installation EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 log_step "安装 Xray..."
-bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+install_xray() {
+    local status=0
+    XRAY_INSTALLER=$(mktemp) || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 \
+        https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$XRAY_INSTALLER"; then
+        rm -f -- "$XRAY_INSTALLER"
+        log_error "下载 Xray 安装器失败，尚未运行安装器；请检查网络后重试"
+        return 1
+    fi
+    if [ ! -s "$XRAY_INSTALLER" ] || ! bash -n "$XRAY_INSTALLER"; then
+        rm -f -- "$XRAY_INSTALLER"
+        log_error "Xray 安装器为空或语法不完整，停止部署"
+        return 1
+    fi
+    INSTALLATION_STARTED=true
+    bash "$XRAY_INSTALLER" install || status=$?
+    rm -f -- "$XRAY_INSTALLER"
+    if [ "$status" -ne 0 ]; then
+        log_error "Xray 安装器执行失败（退出码: ${status}）"
+        return "$status"
+    fi
+    if ! command -v xray >/dev/null 2>&1; then
+        log_error "Xray 安装器已退出，但找不到 xray 程序，停止部署"
+        return 1
+    fi
+}
+install_xray
 log_info "Xray 安装完成"
 
 # ---- 生成密钥对 ----
@@ -411,22 +478,25 @@ SHORT_ID=$(openssl rand -hex 8)
 # ---- 获取服务器 IP ----
 # 强制 IPv4：服务端监听 0.0.0.0（仅 IPv4），且 IPv6 地址写入
 # VLESS 链接时需要加方括号，统一取 IPv4 避免生成不可用的配置
-get_server_ipv4() {
-    local url candidate octet valid
+is_valid_ipv4() {
+    local candidate="$1" octet
     local -a octets
+    [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$candidate"
+    for octet in "${octets[@]}"; do
+        # 拒绝前导零，避免客户端对地址产生不同解释。
+        if [[ ${#octet} -gt 1 && "$octet" == 0* ]] || (( 10#$octet > 255 )); then
+            return 1
+        fi
+    done
+    return 0
+}
+
+get_server_ipv4() {
+    local url candidate
     for url in https://ifconfig.me/ip https://api.ip.sb/ip https://ipinfo.io/ip; do
         candidate=$(curl -4fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null) || continue
-        [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
-        IFS=. read -r -a octets <<< "$candidate"
-        valid=true
-        for octet in "${octets[@]}"; do
-            # 拒绝前导零，避免客户端对地址产生不同解释。
-            if [[ ${#octet} -gt 1 && "$octet" == 0* ]] || (( 10#$octet > 255 )); then
-                valid=false
-                break
-            fi
-        done
-        if [ "$valid" = true ]; then
+        if is_valid_ipv4 "$candidate"; then
             printf '%s\n' "$candidate"
             return 0
         fi
@@ -435,7 +505,7 @@ get_server_ipv4() {
 }
 
 if ! SERVER_IP=$(get_server_ipv4); then
-    log_error "所有公网 IP 接口均请求失败或返回无效 IPv4，停止部署。请检查网络后重试。"
+    log_error "所有公网 IP 接口均请求失败或返回无效 IPv4，停止部署。请检查网络。"
     exit 1
 fi
 
@@ -456,6 +526,62 @@ echo ""
 # =============================================================
 # 安装并配置 Cloudflare WARP (如果启用)
 # =============================================================
+verify_warp_proxy() {
+    local listeners trace candidate
+    listeners=$(ss -H -ltn "sport = :${WARP_SOCKS_PORT}") || return 1
+    [ -n "$listeners" ] || return 1
+
+    # 禁用 curlrc 和 NO_PROXY 绕过，确保探测实际经过指定 SOCKS5。
+    # 使用 IPv4 目标，避免 SOCKS5 远程解析选用 IPv6；trace 验证实际 WARP 出口。
+    trace=$(curl --disable -4fsS --connect-timeout 3 --max-time 8 \
+        --noproxy "" --proxy "socks5h://127.0.0.1:${WARP_SOCKS_PORT}" \
+        https://1.1.1.1/cdn-cgi/trace 2>/dev/null) || return 1
+    printf '%s\n' "$trace" | grep -Eq '^warp=(on|plus)$' || return 1
+    candidate=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p')
+    is_valid_ipv4 "$candidate" || return 1
+    WARP_IP="$candidate"
+}
+
+install_warp_rpm() {
+    local manager major repo_content
+    if command -v dnf >/dev/null 2>&1; then
+        manager=dnf
+    else
+        manager=yum
+    fi
+
+    if [ "$OS_ID" != fedora ]; then
+        major=${VERSION_ID%%.*}
+        case "$major" in
+            9|10) ;;
+            *)
+                log_error "Cloudflare 当前支持 EL 9/10；此系统版本不受支持: ${VERSION_ID}"
+                return 1
+                ;;
+        esac
+        # RHEL 系 WARP 的桌面组件依赖 EPEL；Fedora 使用自身仓库。
+        if ! rpm -q epel-release >/dev/null 2>&1; then
+            "$manager" install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${major}.noarch.rpm" || return 1
+        fi
+    fi
+
+    # 官方提供 .repo 文件，不提供 cloudflare-release-el*.rpm。
+    if ! repo_content=$(curl -fsSL --connect-timeout 10 --max-time 60 \
+        https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo) || [ -z "$repo_content" ]; then
+        log_error "下载 Cloudflare WARP 软件源失败"
+        return 1
+    fi
+    if [ "$OS_ID" != fedora ]; then
+        # RHEL 的 releasever 可能包含次版本号，Cloudflare 仓库使用主版本。
+        repo_content=${repo_content//\$releasever/$major}
+    fi
+    printf '%s\n' "$repo_content" > /etc/yum.repos.d/cloudflare-warp.repo || return 1
+    if ! "$manager" install -y cloudflare-warp; then
+        log_error "WARP 软件包安装失败；EL 系统请确认 EPEL 和 CRB/CodeReady Builder 依赖仓库可用"
+        return 1
+    fi
+}
+
 if [ "$ENABLE_WARP" = true ]; then
     log_step "安装 Cloudflare WARP..."
 
@@ -478,8 +604,8 @@ if [ "$ENABLE_WARP" = true ]; then
         case "$OS_ID" in
             ubuntu|debian)
                 if [ -z "$OS_VERSION" ]; then
-                    log_error "无法获取系统版本代号（VERSION_CODENAME 为空），请手动安装 cloudflare-warp"
-                    log_error "WARP 无法安装，停止部署；不会自动改为直连。手动安装完成后请重新运行脚本。"
+                    log_error "无法获取系统版本代号（VERSION_CODENAME 为空），请检查 /etc/os-release 或 lsb_release"
+                    log_error "WARP 无法安装，停止部署；请按退出提示清理后重新安装。"
                     exit 1
                 else
                     # 添加 Cloudflare GPG key 和仓库
@@ -494,26 +620,21 @@ if [ "$ENABLE_WARP" = true ]; then
                 fi
                 ;;
             centos|rhel|rocky|almalinux|fedora)
-                # 使用包管理器安装 repo 包，自动处理依赖关系
-                RHEL_VER=$(rpm -E %rhel 2>/dev/null || echo "8")
-                if command -v dnf &> /dev/null; then
-                    dnf install -y "https://pkg.cloudflareclient.com/cloudflare-release-el${RHEL_VER}.rpm" 2>/dev/null \
-                        || dnf install -y "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
-                    dnf install -y cloudflare-warp
-                else
-                    yum install -y "https://pkg.cloudflareclient.com/cloudflare-release-el${RHEL_VER}.rpm" 2>/dev/null \
-                        || yum install -y "https://pkg.cloudflareclient.com/cloudflare-release-el8.rpm"
-                    yum install -y cloudflare-warp
-                fi
+                install_warp_rpm
                 ;;
             *)
-                log_error "不支持的系统: ${OS_ID}，请手动安装 cloudflare-warp"
-                log_error "WARP 无法安装，停止部署；不会自动改为直连。手动安装完成后请重新运行脚本。"
+                log_error "不支持的系统: ${OS_ID}；请使用受支持的发行版，或重新安装时选择不启用 WARP"
+                log_error "WARP 无法安装，停止部署；请按退出提示清理后重新安装。"
                 exit 1
                 ;;
         esac
     else
         log_info "warp-cli 已安装，跳过安装步骤"
+    fi
+
+    if ! command -v warp-cli >/dev/null 2>&1; then
+        log_error "WARP 安装后仍找不到 warp-cli，停止部署"
+        exit 1
     fi
 
     # 配置 WARP（仅在安装成功时执行）
@@ -573,52 +694,34 @@ if [ "$ENABLE_WARP" = true ]; then
         log_info "连接 WARP..."
         warp-cli --accept-tos connect || true
 
-        # 等待连接建立（使用重试循环，最多等 30 秒）
-        # WARP 连接需要与 Cloudflare 边缘服务器建立 WireGuard 隧道，
-        # 根据网络条件可能需要 5-15 秒不等
+        # 同时等待状态、SOCKS5 监听和实际 WARP 出口就绪。
+        # 每次网络探测有独立超时，不能把重试间隔当作总等待时间。
         WARP_CONNECTED=false
-        log_info "等待 WARP 连接建立..."
+        log_info "等待 WARP 连接并验证出口（最多检查 15 次）..."
         for i in $(seq 1 15); do
-            WARP_STATUS=$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")
-            if echo "$WARP_STATUS" | grep -qi "Connected" && ! echo "$WARP_STATUS" | grep -qi "Disconnected"; then
+            WARP_STATUS=$(LC_ALL=C warp-cli --accept-tos status 2>/dev/null) || WARP_STATUS="unknown"
+            if printf '%s\n' "$WARP_STATUS" | grep -qi "Connected" \
+                && ! printf '%s\n' "$WARP_STATUS" | grep -qi "Disconnected" \
+                && verify_warp_proxy; then
                 WARP_CONNECTED=true
-                log_info "WARP 连接成功 (等待了约 $((i*2)) 秒)"
+                log_info "WARP SOCKS5 和出口验证通过，出口 IPv4: ${WARP_IP}"
                 break
             fi
-            sleep 2
+            if [ "$i" -lt 15 ]; then sleep 2; fi
         done
 
-        if [ "$WARP_CONNECTED" = true ]; then
-            # 验证 SOCKS5 端口是否在监听
-            if ss -tlnp | grep -q ":${WARP_SOCKS_PORT}"; then
-                log_info "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 监听正常"
-            else
-                log_warn "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 未检测到监听"
-                log_warn "请稍后手动检查: ss -tlnp | grep ${WARP_SOCKS_PORT}"
-            fi
-
-            # 测试 WARP 出口 IP（通过 WARP SOCKS5 代理访问）
-            WARP_IP=$(curl -s --max-time 10 --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me 2>/dev/null || echo "获取失败")
-            log_info "WARP 出口 IP: ${WARP_IP}"
-            if [ "$WARP_IP" != "$SERVER_IP" ] && [ "$WARP_IP" != "获取失败" ]; then
-                log_info "WARP 出口 IP 与 VPS IP 不同，WARP 工作正常"
-            else
-                log_warn "WARP 出口 IP 获取异常，请稍后手动验证:"
-                log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
-            fi
-        else
-            log_warn "WARP 连接超时 (等待了 30 秒)"
+        if [ "$WARP_CONNECTED" != true ]; then
+            log_warn "WARP 连接或出口验证失败（已检查 15 次）"
             log_warn "最后状态: ${WARP_STATUS}"
             log_warn ""
-            log_warn "这通常是因为 WARP 守护进程刚启动需要更多时间"
-            log_warn "请稍后手动执行以下命令来完成连接:"
+            log_warn "请排查 WARP 守护进程、端口和网络连通性；以下命令可用于诊断:"
             log_warn "  warp-cli disconnect"
             log_warn "  warp-cli mode proxy"
             log_warn "  warp-cli proxy port ${WARP_SOCKS_PORT}"
             log_warn "  warp-cli connect"
             log_warn "  warp-cli status"
-            log_warn "  curl --socks5 127.0.0.1:${WARP_SOCKS_PORT} ifconfig.me"
-            log_error "WARP 连接超时，停止部署；不会自动改为直连。连接恢复后请重新运行脚本。"
+            log_warn "  curl --noproxy '' --proxy socks5h://127.0.0.1:${WARP_SOCKS_PORT} https://1.1.1.1/cdn-cgi/trace"
+            log_error "WARP 未通过连通性验证，停止部署；不会自动改为直连。"
             exit 1
         fi
 
@@ -748,7 +851,6 @@ build_warp_domain_rules() {
 # =============================================================
 log_step "生成 Xray 服务端候选配置..."
 XRAY_CANDIDATE=$(mktemp "${XRAY_CONFIG}.new.XXXXXX")
-trap 'rm -f -- "$XRAY_CANDIDATE"' EXIT
 # 继承现有配置的属主和权限，使服务账户仍可读取配置。
 if [ -f "$XRAY_CONFIG" ]; then
     cp -p "$XRAY_CONFIG" "$XRAY_CANDIDATE"
@@ -982,7 +1084,8 @@ log_info "服务端候选配置已生成"
 # 验证配置
 # =============================================================
 log_step "验证配置文件..."
-if xray run -test -config "$XRAY_CANDIDATE"; then
+# mktemp 生成的文件以随机字符结尾，必须显式指定 JSON 格式。
+if xray run -test -format json -config "$XRAY_CANDIDATE"; then
     log_info "配置文件验证通过"
 else
     log_error "配置文件验证失败，请检查"
@@ -993,16 +1096,31 @@ fi
 # 防火墙放行端口
 # =============================================================
 log_step "配置防火墙..."
-if command -v ufw &> /dev/null; then
-    ufw allow ${INPUT_PORT}/tcp
-    log_info "ufw 已放行端口 ${INPUT_PORT}"
-elif command -v firewall-cmd &> /dev/null; then
-    firewall-cmd --permanent --add-port=${INPUT_PORT}/tcp
-    firewall-cmd --reload
-    log_info "firewalld 已放行端口 ${INPUT_PORT}"
-else
-    log_warn "未检测到防火墙工具，请手动放行端口 ${INPUT_PORT}"
-fi
+configure_firewall() {
+    local port="$1" ufw_status configured=false
+    if command -v ufw >/dev/null 2>&1; then
+        if ! ufw_status=$(LC_ALL=C ufw status); then
+            log_error "无法读取 UFW 状态，停止部署"
+            return 1
+        fi
+        if printf '%s\n' "$ufw_status" | grep -q '^Status: active$'; then
+            ufw allow "${port}/tcp" || return 1
+            log_info "ufw 已放行端口 ${port}"
+            configured=true
+        fi
+    fi
+    # 两种防火墙都启用时分别放行；不启动原本停用的防火墙。
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-port="${port}/tcp" || return 1
+        firewall-cmd --add-port="${port}/tcp" || return 1
+        log_info "firewalld 已放行端口 ${port}（持久和运行时规则）"
+        configured=true
+    fi
+    if [ "$configured" = false ]; then
+        log_warn "未检测到启用的 UFW/firewalld；请确认其他防火墙及云安全组放行端口 ${port}"
+    fi
+}
+configure_firewall "$INPUT_PORT"
 
 # =============================================================
 # 启动 Xray
@@ -1041,10 +1159,11 @@ else
     exit 1
 fi
 
-if ss -tlnp | grep -q ":${INPUT_PORT}"; then
+if XRAY_LISTENERS=$(ss -H -ltn4 "sport = :${INPUT_PORT}") && [ -n "$XRAY_LISTENERS" ]; then
     log_info "端口 ${INPUT_PORT} 监听正常"
 else
-    log_warn "端口 ${INPUT_PORT} 未检测到监听，请检查: ss -tlnp | grep ${INPUT_PORT}"
+    log_error "端口 ${INPUT_PORT} 未检测到监听，停止部署；请检查 Xray 服务日志"
+    exit 1
 fi
 
 # =============================================================
