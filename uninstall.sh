@@ -44,7 +44,7 @@ usage() {
 
 本脚本将删除：
   - Xray 程序、systemd 服务、配置和日志
-  - /root/sing-box-config
+  - /sing-box-config（兼容清理旧目录 /root/sing-box-config）
   - cloudflare-warp 软件包、warp-svc 服务、注册状态和软件源
 
 本脚本不会删除：
@@ -213,6 +213,7 @@ remove_xray_files() {
 
 remove_original_client_configs() {
     log_step "删除原版 sing-box 客户端配置"
+    remove_directory "/sing-box-config"
     remove_directory "/root/sing-box-config"
 }
 

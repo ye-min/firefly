@@ -82,7 +82,7 @@ check_existing_installation() {
         fi
     done
     for path in /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray \
-        /usr/local/lib/xray /var/log/xray /root/sing-box-config \
+        /usr/local/lib/xray /var/log/xray /root/sing-box-config /sing-box-config \
         /etc/cloudflare-warp /var/lib/cloudflare-warp /var/log/cloudflare-warp \
         /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
         /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
@@ -130,15 +130,15 @@ if command -v apt-get &> /dev/null; then
     apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || \
         log_warn "系统软件包升级过程中有警告，继续执行..."
     log_info "系统软件包已升级"
-    apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release iproute2
+    apt-get install -y unzip curl openssl wget ca-certificates gnupg lsb-release iproute2 python3
 elif command -v dnf &> /dev/null; then
     # Fedora / 新版 RHEL 系（dnf 优先于 yum，因为 yum 在 RHEL8+ 仅是 dnf 的别名）
     dnf update -y
-    dnf install -y unzip curl openssl wget ca-certificates gnupg2 iproute
+    dnf install -y unzip curl openssl wget ca-certificates gnupg2 iproute python3
 elif command -v yum &> /dev/null; then
     # CentOS / RHEL 旧版
     yum update -y
-    yum install -y unzip curl openssl wget ca-certificates gnupg2 iproute
+    yum install -y unzip curl openssl wget ca-certificates gnupg2 iproute python3
 else
     log_warn "未识别的包管理器，请确保系统已更新且已安装: unzip curl openssl wget"
 fi
@@ -162,7 +162,9 @@ check_tcp_port_available() {
 # =============================================================
 # 欢迎界面
 # =============================================================
-clear
+if [[ -t 1 && -n "${TERM:-}" ]]; then
+    clear || true
+fi
 echo ""
 print_dline
 echo -e "${BOLD}${MAGENTA}     Xray VLESS + Reality 一键部署${NC}"
@@ -487,6 +489,78 @@ verify_warp_proxy() {
     WARP_IP="$candidate"
 }
 
+# 验证 SOCKS5 UDP ASSOCIATE 和实际 DNS 往返；TCP 控制连接需保持打开。
+verify_warp_udp() {
+    python3 - "$WARP_SOCKS_PORT" <<'PYUDP'
+import os
+import socket
+import struct
+import sys
+
+
+def read_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise OSError("SOCKS5 connection closed")
+        data += chunk
+    return data
+
+
+def read_address(sock, atyp):
+    if atyp == 1:
+        return socket.inet_ntop(socket.AF_INET, read_exact(sock, 4))
+    if atyp == 4:
+        return socket.inet_ntop(socket.AF_INET6, read_exact(sock, 16))
+    if atyp == 3:
+        return read_exact(sock, read_exact(sock, 1)[0]).decode("ascii")
+    raise OSError("Invalid SOCKS5 address")
+
+
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3) as control:
+        control.sendall(b"\x05\x01\x00")
+        if read_exact(control, 2) != b"\x05\x00":
+            raise OSError("SOCKS5 authentication failed")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.bind(("127.0.0.1", 0))
+            udp.settimeout(3)
+            control.sendall(b"\x05\x03\x00\x01" + socket.inet_aton("127.0.0.1")
+                            + struct.pack("!H", udp.getsockname()[1]))
+            version, status, reserved, atyp = read_exact(control, 4)
+            if (version, status, reserved) != (5, 0, 0):
+                raise OSError("UDP ASSOCIATE rejected")
+            host = read_address(control, atyp)
+            port = struct.unpack("!H", read_exact(control, 2))[0]
+            if host == "0.0.0.0":
+                host = "127.0.0.1"
+            udp.connect((host, port))
+            for resolver in ("1.1.1.1", "8.8.8.8"):
+                query_id = os.urandom(2)
+                question = b"\x07example\x03com\x00\x00\x01\x00\x01"
+                query = query_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
+                header = b"\x00\x00\x00\x01" + socket.inet_aton(resolver) + b"\x00\x35"
+                udp.send(header + query)
+                try:
+                    packet = udp.recv(4096)
+                except socket.timeout:
+                    continue
+                # 只接受来自本次查询目标的未分片 SOCKS5 UDP 响应。
+                if not packet.startswith(header):
+                    continue
+                answer = packet[len(header):]
+                if (len(answer) >= 12 and answer[:2] == query_id
+                        and answer[2] & 0x80 and answer[3] & 0x0f == 0
+                        and struct.unpack("!H", answer[6:8])[0] > 0):
+                    sys.exit(0)
+            raise OSError("No valid UDP DNS response")
+except (OSError, ValueError, UnicodeError) as error:
+    print("WARP UDP probe failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PYUDP
+}
+
 install_warp_rpm() {
     local manager major repo_content
     if command -v dnf >/dev/null 2>&1; then
@@ -677,6 +751,17 @@ if [ "$ENABLE_WARP" = true ]; then
             exit 1
         fi
 
+        if [ "$WARP_ROUTE_MODE" = all ]; then
+            log_step "验证 WARP UDP 转发能力..."
+            if verify_warp_udp; then
+                WARP_UDP_SUPPORTED=true
+                log_info "WARP UDP DNS 往返验证通过"
+            else
+                WARP_UDP_SUPPORTED=false
+                log_warn "WARP UDP 未通过验证：全流量模式将阻断 UDP，仅 TCP 走 WARP；不会回退直连。"
+                log_warn "QUIC、游戏及语音等 UDP 应用可能不可用。"
+            fi
+        fi
 
     fi
 fi
@@ -821,6 +906,11 @@ XRAY_CANDIDATE=$(mktemp "${XRAY_CONFIG}.new.XXXXXX")
 
 # 根据是否启用 WARP 以及路由模式，生成不同的服务端配置
 if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
+    # UDP 未通过实测时明确阻断，禁止静默回退到 VPS 直连。
+    WARP_UDP_RULE=""
+    if [ "${WARP_UDP_SUPPORTED:-false}" != true ]; then
+        WARP_UDP_RULE='{"type":"field","network":"udp","outboundTag":"block"},'
+    fi
     # ---- 全部流量走 WARP：default outbound 改为 warp ----
     cat > "$XRAY_CANDIDATE" << EOF
 {
@@ -884,6 +974,7 @@ if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
+      ${WARP_UDP_RULE}
       {
         "type": "field",
         "ip": ["geoip:private"],
@@ -1168,8 +1259,12 @@ fi
 # 生成 sing-box 1.13+ 客户端配置
 # =============================================================
 
-SINGBOX_CONFIG_DIR="/root/sing-box-config"
-mkdir -p "${SINGBOX_CONFIG_DIR}"
+SINGBOX_CONFIG_DIR="/sing-box-config"
+# sudo 保留原始用户；直接 root 执行时不猜测其他登录用户。
+CONFIG_OWNER=${SUDO_USER:-root}
+CONFIG_OWNER_UID=$(id -u "$CONFIG_OWNER")
+mkdir -m 700 -p "$SINGBOX_CONFIG_DIR"
+chmod 700 "$SINGBOX_CONFIG_DIR"
 
 # -----------------------------------------------------------------
 # 各 OS 的默认 TLS 指纹
@@ -1435,6 +1530,7 @@ EOF
 
         echo '}'
     } > "$outfile"
+    chmod 600 "$outfile"
 
     # 用 python3 格式化并验证 JSON
     if command -v python3 &> /dev/null; then
@@ -1463,6 +1559,13 @@ for _os in "${ALL_OS_LIST[@]}"; do
     done
 done
 
+# 生成期间目录保持 root 私有，全部完成后授予调用者读写权限。
+for _config in "$SINGBOX_CONFIG_DIR"/*.json; do
+    chmod 600 "$_config"
+    chown "${CONFIG_OWNER_UID}:0" "$_config"
+done
+chown "${CONFIG_OWNER_UID}:0" "$SINGBOX_CONFIG_DIR"
+log_info "配置目录所有者: ${CONFIG_OWNER}（root 同样可读写）"
 log_info "全部配置已保存至目录: ${SINGBOX_CONFIG_DIR}/"
 
 # =============================================================
@@ -1536,7 +1639,11 @@ if [ "$ENABLE_WARP" = true ]; then
             echo -e "    ${GREEN}✓${NC} Netflix (netflix.com, nflxvideo.net, ...)"
             ;;
         all)
-            echo -e "    ${GREEN}✓${NC} 全部出站流量"
+            if [ "${WARP_UDP_SUPPORTED:-false}" = true ]; then
+                echo -e "    ${GREEN}✓${NC} TCP + UDP 走 WARP（UDP DNS 探测通过）"
+            else
+                echo -e "    ${YELLOW}!${NC} TCP 走 WARP；UDP 未通过验证，已阻断"
+            fi
             ;;
     esac
     echo ""
