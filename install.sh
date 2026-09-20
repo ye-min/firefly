@@ -1248,10 +1248,26 @@ else
     exit 1
 fi
 
-if XRAY_LISTENERS=$(ss -H -ltn4 "sport = :${INPUT_PORT}") && [ -n "$XRAY_LISTENERS" ]; then
+# Xray/Go 在部分系统上会用一个 IPv6 通配 socket（[::]:port）同时
+# 接受 IPv4 和 IPv6。这里不能用 ss -4，否则会把正常的双栈监听误判为失败。
+# 同时给服务留出最多 15 秒完成监听，避免固定等待 2 秒造成启动竞态。
+XRAY_LISTENERS=""
+for _attempt in $(seq 1 15); do
+    XRAY_LISTENERS=$(ss -H -ltn "sport = :${INPUT_PORT}" 2>/dev/null || true)
+    if [ -n "$XRAY_LISTENERS" ]; then
+        break
+    fi
+    if ! systemctl is-active --quiet xray; then
+        break
+    fi
+    sleep 1
+done
+
+if [ -n "$XRAY_LISTENERS" ]; then
     log_info "端口 ${INPUT_PORT} 监听正常"
 else
-    log_error "端口 ${INPUT_PORT} 未检测到监听，停止部署；请检查 Xray 服务日志"
+    log_error "端口 ${INPUT_PORT} 未检测到监听，停止部署"
+    journalctl -u xray -n 50 --no-pager || true
     exit 1
 fi
 
