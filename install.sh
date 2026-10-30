@@ -902,7 +902,8 @@ secure_xray_config() {
 
 log_step "生成 Xray 服务端候选配置..."
 # mktemp 的 root/600 权限保护写入过程，完成后再授予服务账户读取权限。
-XRAY_CANDIDATE=$(mktemp "${XRAY_CONFIG}.new.XXXXXX")
+# 新版 Xray 也会校验实际文件扩展名，候选文件必须以 .json 结尾。
+XRAY_CANDIDATE=$(mktemp --suffix=.json "${XRAY_CONFIG}.new.XXXXXX")
 
 # 根据是否启用 WARP 以及路由模式，生成不同的服务端配置
 if [ "$ENABLE_WARP" = true ] && [ "$WARP_ROUTE_MODE" = "all" ]; then
@@ -1137,7 +1138,7 @@ log_info "服务端候选配置已生成"
 # 验证配置
 # =============================================================
 log_step "验证配置文件..."
-# mktemp 生成的文件以随机字符结尾，必须显式指定 JSON 格式。
+# 同时保留 .json 扩展名和显式格式参数，兼容不同版本的配置加载器。
 if xray run -test -format json -config "$XRAY_CANDIDATE"; then
     log_info "配置文件验证通过"
 else
