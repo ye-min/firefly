@@ -128,10 +128,26 @@ confirm_uninstall() {
     fi
 }
 
+# systemctl show 对不存在的 unit 可能输出 not-found 并返回 4。
+# 仅接受这个明确组合，避免把通信或权限错误当作已卸载。
+get_unit_load_state() {
+    local unit=$1 state status=0
+    state=$(systemctl show "$unit" --property=LoadState --value) || status=$?
+    if (( status != 0 )) && ! { (( status == 4 )) && [[ $state == not-found ]]; }; then
+        log_error "无法查询服务状态: $unit (退出码: $status，LoadState: ${state:-空})"
+        return 1
+    fi
+    if [[ -z $state ]]; then
+        log_error "服务状态为空: $unit"
+        return 1
+    fi
+    printf '%s\n' "$state"
+}
+
 # 不对不存在的服务执行 stop；通信失败必须显式报错。
 stop_service() {
     local unit=$1 state
-    state=$(systemctl show "$unit" --property=LoadState --value) || return 1
+    state=$(get_unit_load_state "$unit") || return 1
     if [[ $state == not-found ]]; then
         return 0
     fi
@@ -316,14 +332,17 @@ verify_removal() {
         fi
     done
     for name in ${XRAY_UNITS[@]+"${XRAY_UNITS[@]}"} warp-svc.service; do
-        state=$(systemctl show "$name" --property=LoadState --value) || return 1
+        state=$(get_unit_load_state "$name") || return 1
         if [[ $state != not-found ]]; then
             log_error "服务仍存在或无法确认已移除: $name ($state)"
             failed=1
         fi
     done
     # 模板没有实例，不能用 systemctl show 查询运行时属性。
-    template_files=$(systemctl list-unit-files --no-legend --no-pager xray@.service) || return 1
+    if ! template_files=$(systemctl list-unit-files --no-legend --no-pager xray@.service); then
+        log_error "无法查询 Xray 服务模板是否已移除"
+        return 1
+    fi
     if [[ -n $template_files ]]; then
         log_error "服务模板仍存在: xray@.service"
         failed=1
