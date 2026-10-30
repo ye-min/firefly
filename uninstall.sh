@@ -152,17 +152,31 @@ stop_service() {
         return 0
     fi
     [[ -n $state ]] || return 1
-    run_cmd systemctl stop "$unit" || return 1
-    run_cmd systemctl disable "$unit" || return 1
+    if ! run_cmd systemctl stop "$unit"; then
+        log_error "停止服务失败: $unit"
+        return 1
+    fi
+    if ! run_cmd systemctl disable "$unit"; then
+        log_error "禁用服务失败: $unit"
+        return 1
+    fi
     if (( DRY_RUN )); then
         run_cmd systemctl reset-failed "$unit"
         return $?
     fi
     # 正常停止的 unit 可能已被 systemd 回收，无需再 reset-failed。
     # 仅重置仍处于 failed 状态的 unit；状态查询失败不能当作已停止。
-    state=$(systemctl show "$unit" --property=ActiveState --value) || return 1
+    if ! state=$(systemctl show "$unit" --property=ActiveState --value); then
+        log_error "无法查询停止后的服务状态: $unit (ActiveState: ${state:-空})"
+        return 1
+    fi
     case "$state" in
-        failed) run_cmd systemctl reset-failed "$unit" || return 1 ;;
+        failed)
+            if ! run_cmd systemctl reset-failed "$unit"; then
+                log_error "清除服务失败状态失败: $unit"
+                return 1
+            fi
+            ;;
         inactive) ;;
         *)
             log_error "服务尚未停止或状态未知: $unit ($state)"
@@ -174,9 +188,17 @@ stop_service() {
 
 stop_xray() {
     log_step "停止并禁用 Xray 服务及实例"
-    local units files unit
-    units=$(systemctl list-units --all --plain --no-legend 'xray@*.service') || return 1
-    files=$(systemctl list-unit-files --no-legend 'xray@*.service') || return 1
+    local units files unit status=0
+    units=$(systemctl list-units --all --plain --no-legend 'xray@*.service') || status=$?
+    if (( status != 0 )); then
+        log_error "无法列出 Xray 服务实例 (退出码: $status)"
+        return 1
+    fi
+    files=$(systemctl list-unit-files --no-legend 'xray@*.service') || status=$?
+    if (( status != 0 )); then
+        log_error "无法列出 Xray 服务实例文件 (退出码: $status)"
+        return 1
+    fi
     XRAY_UNITS=("xray.service")
     while read -r unit _; do
         if [[ $unit == xray@*.service && $unit != xray@.service ]]; then
