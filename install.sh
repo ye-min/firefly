@@ -207,20 +207,21 @@ while true; do
 done
 
 # ---- SNI ----
-is_valid_sni() {
-    local LC_ALL=C domain="$1"
-    # 裸域名总长不超过 253，每段 1-63 字符，连字符不能位于段首或段尾。
-    [[ ${#domain} -le 253 && "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
-        && [[ ! "$domain" =~ ^[0-9.]+$ ]]
-}
+echo ""
+echo -e "  ${BOLD}选择 SNI 域名:${NC}"
+echo ""
+echo -e "  ${GREEN}1)${NC} unpkg.com ${DIM}（默认）${NC}"
+echo -e "  ${GREEN}2)${NC} cdn.jsdelivr.net"
+echo ""
 
 while true; do
-    IFS= read -r -p "$(echo -e ${CYAN}'请输入 SNI 域名（直接回车使用默认 cdn.jsdelivr.net）: '${NC})" INPUT_SNI
-    INPUT_SNI=${INPUT_SNI:-cdn.jsdelivr.net}
-    if is_valid_sni "$INPUT_SNI"; then
-        break
-    fi
-    log_error "SNI 必须是有效的裸域名（如 cdn.jsdelivr.net），不能包含协议、端口、路径、空格或引号，也不能使用 IP 地址"
+    IFS= read -r -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认 unpkg.com）: '${NC})" SNI_CHOICE
+    SNI_CHOICE=${SNI_CHOICE:-1}
+    case "$SNI_CHOICE" in
+        1) INPUT_SNI=unpkg.com; break ;;
+        2) INPUT_SNI=cdn.jsdelivr.net; break ;;
+        *) log_error "无效选项，请输入 1-2" ;;
+    esac
 done
 
 # =============================================================
