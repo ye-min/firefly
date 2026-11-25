@@ -15,7 +15,7 @@
 #     - Cloudflare WARP 集成 (ChatGPT/Claude/Google/Netflix)
 #     - 始终生成全平台客户端配置 (iOS/macOS/Android/Windows/Linux)
 #     - 各平台自动使用默认 TLS 指纹
-#     - 路由模式选择（全局代理 / 国内外分流）
+#     - 各平台同时生成全局代理与国内外分流配置
 #     - 生成完整 sing-box 1.13+ 客户端 JSON 配置
 #     - 生成 VLESS 分享链接
 #     - 系统依赖自动安装 (apt/yum/dnf，仅支持 systemd 环境)
@@ -295,27 +295,20 @@ else
 fi
 
 # =============================================================
-# 交互 — 路由模式
+# 客户端路由模式（全局与分流都会生成，无需选择）
 # =============================================================
 echo ""
 print_line
-echo -e "${BOLD}  请选择 sing-box 客户端路由模式${NC}"
+echo -e "${BOLD}  sing-box 客户端将同时生成两种路由配置${NC}"
 print_line
 echo ""
-echo -e "  ${GREEN}1)${NC} 全局代理     ${YELLOW}← 所有流量走代理${NC}"
-echo -e "  ${GREEN}2)${NC} 分流模式     ${YELLOW}← 国内直连 + 国外代理 (推荐)${NC}"
+echo -e "  ${CYAN}每个系统各一份，无需选择:${NC}"
+echo -e "  ${GREEN}分流模式${NC}  ${YELLOW}国内直连 + 国外代理 (推荐)${NC}"
+echo -e "           ${DIM}config_<os>_split.json${NC}"
+echo -e "  ${GREEN}全局代理${NC}  ${YELLOW}所有流量走代理${NC}"
+echo -e "           ${DIM}config_<os>_global.json${NC}"
 echo ""
-
-while true; do
-    read -p "$(echo -e ${CYAN}'请输入选项 [1-2]（直接回车默认分流模式）: '${NC})" ROUTE_CHOICE
-    ROUTE_CHOICE=${ROUTE_CHOICE:-2}
-    case "$ROUTE_CHOICE" in
-        1) ROUTE_MODE="global"; break ;;
-        2) ROUTE_MODE="split";  break ;;
-        *) log_error "无效选项，请输入 1-2" ;;
-    esac
-done
-log_info "已选择路由模式: ${ROUTE_MODE}"
+log_info "两种路由配置都会生成"
 
 echo ""
 echo ""
@@ -329,7 +322,8 @@ echo -e "  SNI         : ${GREEN}${INPUT_SNI}${NC}"
 echo -e "  WARP        : ${GREEN}$([ "$ENABLE_WARP" = true ] && echo "启用 (${WARP_ROUTE_MODE})" || echo "未启用")${NC}"
 echo -e "  客户端配置  : ${GREEN}全平台（iOS / macOS / Android / Windows / Linux）${NC}"
 echo -e "  TLS 指纹    : ${GREEN}iOS=safari，Linux=firefox，其他平台=chrome${NC}"
-echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
+echo -e "  路由模式    : ${GREEN}config_<os>_split.json（推荐）${NC}"
+echo -e "                ${GREEN}config_<os>_global.json${NC}"
 echo ""
 read -p "$(echo -e ${CYAN}'确认以上配置开始部署？[Y/n]: '${NC})" CONFIRM
 CONFIRM=${CONFIRM:-Y}
@@ -1622,7 +1616,8 @@ echo -e "  Public Key  : ${GREEN}${PUBLIC_KEY}${NC}"
 echo -e "  Short ID    : ${GREEN}${SHORT_ID}${NC}"
 echo -e "  客户端配置  : ${GREEN}全平台（iOS / macOS / Android / Windows / Linux）${NC}"
 echo -e "  TLS 指纹    : ${GREEN}iOS=safari，Linux=firefox，其他平台=chrome${NC}"
-echo -e "  路由模式    : ${GREEN}${ROUTE_MODE}${NC}"
+echo -e "  路由模式    : ${GREEN}config_<os>_split.json（推荐）${NC}"
+echo -e "                ${GREEN}config_<os>_global.json${NC}"
 echo ""
 
 # ---- 2. WARP 状态 ----
@@ -1802,13 +1797,15 @@ print_platform_instructions() {
             echo -e "  ${CYAN}TUN 入站 :${NC} 全局接管流量（需 root / CAP_NET_ADMIN）"
             echo -e "  ${CYAN}Mixed入站:${NC} 127.0.0.1:2080  终端: ${GREEN}export all_proxy=socks5://127.0.0.1:2080${NC}"
             echo -e "  ${CYAN}TProxy   :${NC} 端口 7893 供旁路由/网关透明代理"
-            echo -e "  ${CYAN}启动命令 :${NC} ${GREEN}sudo sing-box run -c ./config_linux_${ROUTE_MODE}.json${NC}"
+            echo -e "  ${CYAN}启动命令 :${NC} ${GREEN}sudo sing-box run -c ./config_linux_split.json${NC} ${DIM}（推荐）${NC}"
+            echo -e "           ${GREEN}sudo sing-box run -c ./config_linux_global.json${NC} ${DIM}（全局代理）${NC}"
             ;;
     esac
 }
 for _os in "${ALL_OS_LIST[@]}"; do
     echo -e "  ${BOLD}${CYAN}${_os}${NC}"
-    echo -e "  ${CYAN}配置文件 :${NC} ${GREEN}config_${_os}_${ROUTE_MODE}.json${NC}"
+    echo -e "  ${CYAN}配置文件 :${NC} ${GREEN}config_${_os}_split.json${NC} ${DIM}（推荐，国内直连 / 国外代理）${NC}"
+    echo -e "           ${GREEN}config_${_os}_global.json${NC} ${DIM}（全局代理，所有流量走代理）${NC}"
     print_platform_instructions "$_os"
     echo ""
 done
